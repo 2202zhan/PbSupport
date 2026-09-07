@@ -1,0 +1,233 @@
+import asyncio
+import json
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Iterator
+
+from config import settings
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id TEXT NOT NULL,
+    username TEXT,
+    contact TEXT,
+    problem_type TEXT NOT NULL,
+    apparat_name TEXT,
+    raw_text TEXT,
+    transaction_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    evidence_json TEXT NOT NULL,
+    ai_action TEXT,
+    ai_reasoning TEXT,
+    guard_triggered TEXT,
+    final_action TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS escalations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    staff_chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    resolved_by TEXT,
+    resolution TEXT,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(settings.support_bot_db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    with _connect() as conn:
+        conn.executescript(_SCHEMA)
+
+
+@dataclass
+class TicketRecord:
+    id: int
+    telegram_id: str
+    username: str | None
+    contact: str | None
+    problem_type: str
+    apparat_name: str | None
+    raw_text: str | None
+    transaction_id: str | None
+    status: str
+    created_at: str
+
+
+def _create_ticket_sync(
+    telegram_id: str,
+    username: str | None,
+    contact: str | None,
+    problem_type: str,
+    apparat_name: str | None,
+    raw_text: str | None,
+) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO tickets (telegram_id, username, contact, problem_type, apparat_name, "
+            "raw_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
+            (telegram_id, username, contact, problem_type, apparat_name, raw_text, _now()),
+        )
+        return cur.lastrowid
+
+
+async def create_ticket(
+    telegram_id: str,
+    username: str | None,
+    contact: str | None,
+    problem_type: str,
+    apparat_name: str | None,
+    raw_text: str | None,
+) -> int:
+    return await asyncio.to_thread(
+        _create_ticket_sync, telegram_id, username, contact, problem_type, apparat_name, raw_text
+    )
+
+
+def _get_ticket_sync(ticket_id: int) -> TicketRecord | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if row is None:
+            return None
+        return TicketRecord(**dict(row))
+
+
+async def get_ticket(ticket_id: int) -> TicketRecord | None:
+    return await asyncio.to_thread(_get_ticket_sync, ticket_id)
+
+
+def _set_ticket_transaction_sync(ticket_id: int, transaction_id: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE tickets SET transaction_id = ? WHERE id = ?", (transaction_id, ticket_id))
+
+
+async def set_ticket_transaction(ticket_id: int, transaction_id: str) -> None:
+    await asyncio.to_thread(_set_ticket_transaction_sync, ticket_id, transaction_id)
+
+
+def _set_ticket_status_sync(ticket_id: int, status: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE tickets SET status = ? WHERE id = ?", (status, ticket_id))
+
+
+async def set_ticket_status(ticket_id: int, status: str) -> None:
+    await asyncio.to_thread(_set_ticket_status_sync, ticket_id, status)
+
+
+def _set_ticket_contact_sync(ticket_id: int, contact: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE tickets SET contact = ? WHERE id = ?", (contact, ticket_id))
+
+
+async def set_ticket_contact(ticket_id: int, contact: str) -> None:
+    await asyncio.to_thread(_set_ticket_contact_sync, ticket_id, contact)
+
+
+def _record_decision_sync(
+    ticket_id: int,
+    evidence: dict[str, Any],
+    ai_action: str | None,
+    ai_reasoning: str | None,
+    guard_triggered: str | None,
+    final_action: str,
+) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO decisions (ticket_id, evidence_json, ai_action, ai_reasoning, "
+            "guard_triggered, final_action, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticket_id,
+                json.dumps(evidence, default=str, ensure_ascii=False),
+                ai_action,
+                ai_reasoning,
+                guard_triggered,
+                final_action,
+                _now(),
+            ),
+        )
+        return cur.lastrowid
+
+
+async def record_decision(
+    ticket_id: int,
+    evidence: dict[str, Any],
+    ai_action: str | None,
+    ai_reasoning: str | None,
+    guard_triggered: str | None,
+    final_action: str,
+) -> int:
+    return await asyncio.to_thread(
+        _record_decision_sync, ticket_id, evidence, ai_action, ai_reasoning, guard_triggered, final_action
+    )
+
+
+def _was_already_refunded_sync(transaction_id: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM decisions WHERE final_action = 'auto_refund' AND "
+            "json_extract(evidence_json, '$.transaction_id') = ? LIMIT 1",
+            (transaction_id,),
+        ).fetchone()
+        return row is not None
+
+
+async def was_already_refunded(transaction_id: str) -> bool:
+    return await asyncio.to_thread(_was_already_refunded_sync, transaction_id)
+
+
+def _create_escalation_sync(ticket_id: int, staff_chat_id: int, message_id: int) -> int:
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO escalations (ticket_id, staff_chat_id, message_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (ticket_id, staff_chat_id, message_id, _now()),
+        )
+        return cur.lastrowid
+
+
+async def create_escalation(ticket_id: int, staff_chat_id: int, message_id: int) -> int:
+    return await asyncio.to_thread(_create_escalation_sync, ticket_id, staff_chat_id, message_id)
+
+
+def _resolve_escalation_sync(message_id: int, resolved_by: str, resolution: str) -> int | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, ticket_id FROM escalations WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute(
+            "UPDATE escalations SET resolved_by = ?, resolution = ?, resolved_at = ? WHERE id = ?",
+            (resolved_by, resolution, _now(), row["id"]),
+        )
+        return row["ticket_id"]
+
+
+async def resolve_escalation(message_id: int, resolved_by: str, resolution: str) -> int | None:
+    return await asyncio.to_thread(_resolve_escalation_sync, message_id, resolved_by, resolution)

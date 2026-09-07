@@ -1,0 +1,32 @@
+[project]
+name = "support-bot"
+version = "0.1.0"
+description = "Автообработка заявок поддержки PrintBox: SNMP/логи + ИИ-решение по возвратам"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.4,<4",
+    "httpx>=0.27,<1",
+    "openai>=1.30,<2",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+    "python-dotenv>=1.0,<2",
+    "pypdf>=4.0,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-asyncio>=0.23,<1",
+]
+
+[tool.setuptools]
+py-modules = [
+    "bot", "config", "api_client", "log_parser", "storage",
+    "diagnosis", "guard_rules", "ai_decider", "advice", "notify", "triage",
+    "tz", "sessions", "concierge", "receipt_parser", "openai_utils",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
