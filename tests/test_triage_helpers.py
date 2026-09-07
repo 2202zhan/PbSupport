@@ -146,11 +146,13 @@ def test_problem_labels_include_device_issue_not_just_personal_complaints():
     }
 
 
-def test_quality_replies_no_longer_falsely_claim_staff_was_notified():
-    # _send_scripted_reply never actually escalates - these used to claim
-    # "Передал сотруднику" right away, which wasn't true.
-    assert "Передал сотруднику" not in triage._QUALITY_REPLIES["faded"]
-    assert "Передал сотруднику" not in triage._QUALITY_REPLIES["streaks"]
+def test_quality_replies_never_ask_the_user_to_service_the_machine():
+    # The user is standing at a kiosk that isn't theirs - telling them to change
+    # a cartridge or clean a drum is both useless and insulting.
+    forbidden = ["картридж", "почист", "замен", "барабан", "перезагруз"]
+    for key, reply in triage._QUALITY_REPLIES.items():
+        lowered = reply.lower()
+        assert not any(word in lowered for word in forbidden), key
 
 
 async def test_suggest_alternate_apparat_finds_other_online_one():
@@ -314,3 +316,19 @@ async def test_nothelped_detail_handles_voice_instead_of_text():
     message = _FakeMessage(None)
     await triage.on_nothelped_detail_provided(message, state=None, bot=None, api=None)
     assert message.answered_with == ["Пожалуйста, напишите текстом, что именно не так."]
+
+
+def test_every_user_facing_prompt_forbids_self_service_advice():
+    # The regression this guards: a model with no service context told a student
+    # standing at our kiosk to replace the cartridge, clean the drum, and call a
+    # paper supplier. Each prompt that writes to the user must carry the limits.
+    import ai_decider
+    import concierge
+
+    for name, prompt in [
+        ("decide", ai_decider._SYSTEM_PROMPT),
+        ("decide_followup", ai_decider._FOLLOWUP_SYSTEM_PROMPT),
+        ("concierge", concierge._SYSTEM_PROMPT),
+    ]:
+        assert "картридж" in prompt, name
+        assert "НИКОГДА не советуй" in prompt, name
