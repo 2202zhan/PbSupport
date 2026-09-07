@@ -42,12 +42,41 @@ def _patched_client(response=None, side_effect=None):
     return patch("ai_decider._client", return_value=fake_client)
 
 
-async def test_auto_refund_tool_call_maps_to_decision():
-    response = _fake_response("auto_refund", {"reason": "clear technical failure, no SNMP printing event"})
+async def test_recommend_refund_tool_call_maps_to_decision():
+    response = _fake_response(
+        "recommend_refund",
+        {
+            "reason": "clear technical failure, no SNMP printing event",
+            "confidence": "high",
+            "draft_reply": "Проверил — принтер не получил ваш файл.",
+        },
+    )
     with _patched_client(response=response):
         decision = await ai_decider.decide(_evidence())
-    assert decision.action == "auto_refund"
+    assert decision.action == "recommend_refund"
     assert "technical failure" in decision.reason
+    assert decision.confidence == "high"
+    assert decision.draft_reply
+
+
+async def test_recommend_refund_without_draft_reply_falls_back_to_escalate():
+    # A recommendation with nothing to send the user is not actionable - staff
+    # would have to write the reply themselves, so treat it as a failed call.
+    response = _fake_response("recommend_refund", {"reason": "no signal", "confidence": "high"})
+    with _patched_client(response=response):
+        decision = await ai_decider.decide(_evidence())
+    assert decision.action == "escalate"
+
+
+async def test_recommend_refund_with_bogus_confidence_defaults_to_low():
+    response = _fake_response(
+        "recommend_refund",
+        {"reason": "no signal", "confidence": "absolutely certain", "draft_reply": "Проверил."},
+    )
+    with _patched_client(response=response):
+        decision = await ai_decider.decide(_evidence())
+    assert decision.action == "recommend_refund"
+    assert decision.confidence == "low"
 
 
 async def test_give_advice_tool_call_maps_to_decision():
@@ -85,7 +114,7 @@ async def test_no_tool_call_falls_back_to_escalate():
 
 
 async def test_invalid_json_arguments_falls_back_to_escalate():
-    response = _fake_response("auto_refund", None, raw_arguments="{not valid json")
+    response = _fake_response("recommend_refund", None, raw_arguments="{not valid json")
     with _patched_client(response=response):
         decision = await ai_decider.decide(_evidence())
     assert decision.action == "escalate"

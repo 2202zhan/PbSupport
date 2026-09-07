@@ -8,7 +8,9 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 
+import csat
 import notify
 import sessions
 import storage
@@ -57,6 +59,31 @@ async def _expire_idle_sessions(bot: Bot, dp: Dispatcher) -> None:
                 logger.exception("failed to expire session for %s", telegram_id)
 
 
+async def _publish_commands(bot: Bot) -> None:
+    """Everyone sees /start; only listed admins get /admin in their command
+    menu. Without per-chat scopes the command is hidden by a check inside the
+    handler but still advertised to every user."""
+    await bot.set_my_commands(
+        [BotCommand(command="start", description="Начать заново")],
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    for raw_id in settings.admin_telegram_ids.split(","):
+        admin_id = raw_id.strip()
+        if not admin_id:
+            continue
+        try:
+            await bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Начать заново"),
+                    BotCommand(command="admin", description="Админ-панель"),
+                ],
+                scope=BotCommandScopeChat(chat_id=int(admin_id)),
+            )
+        except Exception:
+            # A never-started chat rejects this - not worth failing startup over.
+            logger.warning("could not set admin commands for %s", admin_id)
+
+
 async def main() -> None:
     storage.init_db()
 
@@ -64,6 +91,9 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(triage.router)
     dp.include_router(notify.router)
+    dp.include_router(csat.router)
+
+    await _publish_commands(bot)
 
     api = PrintBoxAPIClient()
     expiry_task = asyncio.create_task(_expire_idle_sessions(bot, dp))

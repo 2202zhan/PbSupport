@@ -23,12 +23,9 @@ class Settings(BaseSettings):
     # pydantic-settings expects list-typed env vars to be JSON, not CSV.
     admin_telegram_ids: str = ""
 
-    # Kill switch for the testing phase: while False, every auto_refund verdict
-    # (from the AI) is downgraded to escalate-with-confirm-button - a human always
-    # makes the final call. Flip to True only after the dry-run period in the plan.
-    auto_refund_enabled: bool = False
-
-    auto_refund_hard_cap: float = 1000
+    # Above this amount the staff card gets a "look closer" warning. It no longer
+    # gates anything automatic - a human approves every refund either way.
+    refund_review_amount_cap: float = 1000
     neighbor_window: int = 5
     print_signal_window_minutes: int = 5
     session_timeout_minutes: int = 10

@@ -2,7 +2,7 @@ import guard_rules
 import tz
 from api_client import Apparat, Transaction
 from diagnosis import Evidence, TicketInput
-from guard_rules import Decision, apply_guards
+from guard_rules import Decision, review_refund_case
 
 
 def _ticket(**overrides) -> TicketInput:
@@ -50,86 +50,69 @@ def _evidence(**overrides) -> Evidence:
     return Evidence(**defaults)
 
 
-def _refund_decision(reason: str = "clear technical failure") -> Decision:
-    return Decision(action="auto_refund", reason=reason)
+def test_clean_case_lets_staff_refund():
+    review = review_refund_case(_evidence())
+    assert review.can_refund is True
+    assert review.blockers == []
+    assert review.warnings == []
 
 
-def test_auto_refund_disabled_by_default_forces_escalation():
-    # AUTO_REFUND_ENABLED=false is the current testing-phase default (human always
-    # confirms via the button) - this should hold without touching settings.
-    decision, guard = apply_guards(_evidence(), _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "auto_refund_disabled"
+def test_no_transaction_blocks_the_refund_button():
+    # There is nothing to call the refund API with - offering the button
+    # would just fail on tap.
+    review = review_refund_case(_evidence(transaction=None))
+    assert review.can_refund is False
+    assert "no_transaction_matched" in review.blockers
 
 
-def test_clean_case_passes_through_once_auto_refund_enabled(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    decision, guard = apply_guards(_evidence(), _refund_decision())
-    assert decision.action == "auto_refund"
-    assert guard is None
+def test_already_refunded_blocks_the_refund_button():
+    review = review_refund_case(_evidence(already_refunded=True))
+    assert review.can_refund is False
+    assert "already_refunded" in review.blockers
 
 
-def test_unconfirmed_identity_forces_escalation(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(identity_confirmed=False)
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "identity_unconfirmed"
+def test_unconfirmed_identity_blocks_the_refund_button():
+    review = review_refund_case(_evidence(identity_confirmed=False))
+    assert review.can_refund is False
+    assert "identity_unconfirmed" in review.blockers
 
 
-def test_transaction_ambiguous_forces_escalation(monkeypatch):
+def test_transaction_ambiguous_blocks_the_refund_button():
     # Several of the user's own orders matched the time/amount window and we
-    # couldn't tell them apart (see diagnosis._find_transaction) - the chosen
-    # transaction is a guess, so auto_refund against it is a real money risk.
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(transaction_ambiguous=True)
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "transaction_ambiguous"
+    # couldn't tell them apart (see diagnosis._find_transaction) - refunding
+    # the guessed one could return the wrong order.
+    review = review_refund_case(_evidence(transaction_ambiguous=True))
+    assert review.can_refund is False
+    assert "transaction_ambiguous" in review.blockers
 
 
-def test_mass_outage_forces_escalation(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(mass_outage_suspected=True)
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "mass_outage_suspected"
+def test_mass_outage_warns_but_leaves_the_decision_to_staff():
+    review = review_refund_case(_evidence(mass_outage_suspected=True))
+    assert review.can_refund is True
+    assert "mass_outage_suspected" in review.warnings
 
 
-def test_amount_above_hard_cap_forces_escalation(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(transaction=_transaction(amount=999999))
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "amount_above_hard_cap"
+def test_large_amount_warns_but_leaves_the_decision_to_staff():
+    review = review_refund_case(_evidence(transaction=_transaction(amount=999999)))
+    assert review.can_refund is True
+    assert "amount_above_cap" in review.warnings
 
 
-def test_already_refunded_forces_escalation(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(already_refunded=True)
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "already_refunded"
+def test_blockers_render_as_human_readable_labels():
+    review = review_refund_case(_evidence(transaction=None, identity_confirmed=False))
+    labels = review.blocker_labels
+    assert len(labels) == 2
+    assert all(label != review.blockers[i] for i, label in enumerate(labels))
 
 
-def test_no_transaction_forces_escalation(monkeypatch):
-    monkeypatch.setattr(guard_rules.settings, "auto_refund_enabled", True)
-    evidence = _evidence(transaction=None)
-    decision, guard = apply_guards(evidence, _refund_decision())
-    assert decision.action == "escalate"
-    assert guard == "no_transaction_matched"
-
-
-def test_guards_never_touch_give_advice():
-    evidence = _evidence(identity_confirmed=False, mass_outage_suspected=True)
-    decision, guard = apply_guards(evidence, Decision(action="give_advice", reason="x", user_message="hi"))
-    assert decision.action == "give_advice"
-    assert guard is None
-
-
-def test_guards_never_touch_escalate():
-    evidence = _evidence()
-    original = Decision(action="escalate", reason="ambiguous", staff_summary="please check")
-    decision, guard = apply_guards(evidence, original)
-    assert decision is original
-    assert guard is None
+def test_decision_carries_confidence_and_draft_reply():
+    # The AI's strongest verdict is a recommendation with a prepared message -
+    # notify.py sends that draft only after a human confirms.
+    decision = Decision(
+        action="recommend_refund",
+        reason="SNMP не зафиксировал печать",
+        confidence="high",
+        draft_reply="Проверил — принтер не получил файл.",
+    )
+    assert decision.confidence == "high"
+    assert decision.draft_reply

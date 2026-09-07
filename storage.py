@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     raw_text TEXT,
     transaction_id TEXT,
     status TEXT NOT NULL DEFAULT 'open',
+    draft_reply TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -43,6 +44,15 @@ CREATE TABLE IF NOT EXISTS escalations (
     resolved_at TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS csat (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+    poll_id TEXT NOT NULL UNIQUE,
+    score INTEGER,
+    answered_at TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -64,6 +74,11 @@ def _connect() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        # CREATE TABLE IF NOT EXISTS won't add columns to a database created by
+        # an earlier version, so bring old files forward explicitly.
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(tickets)")}
+        if "draft_reply" not in existing:
+            conn.execute("ALTER TABLE tickets ADD COLUMN draft_reply TEXT")
 
 
 @dataclass
@@ -77,6 +92,7 @@ class TicketRecord:
     raw_text: str | None
     transaction_id: str | None
     status: str
+    draft_reply: str | None
     created_at: str
 
 
@@ -149,6 +165,16 @@ async def set_ticket_contact(ticket_id: int, contact: str) -> None:
     await asyncio.to_thread(_set_ticket_contact_sync, ticket_id, contact)
 
 
+def _set_ticket_draft_reply_sync(ticket_id: int, draft_reply: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE tickets SET draft_reply = ? WHERE id = ?", (draft_reply, ticket_id))
+
+
+async def set_ticket_draft_reply(ticket_id: int, draft_reply: str) -> None:
+    """The message the AI prepared for the user, sent only if staff approve."""
+    await asyncio.to_thread(_set_ticket_draft_reply_sync, ticket_id, draft_reply)
+
+
 def _record_decision_sync(
     ticket_id: int,
     evidence: dict[str, Any],
@@ -188,9 +214,11 @@ async def record_decision(
 
 
 def _was_already_refunded_sync(transaction_id: str) -> bool:
+    # Refunds are only ever recorded by a staff confirmation in notify.py, which
+    # writes the transaction_id into evidence_json so this lookup can find it.
     with _connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM decisions WHERE final_action = 'auto_refund' AND "
+            "SELECT 1 FROM decisions WHERE final_action = 'refund_confirmed' AND "
             "json_extract(evidence_json, '$.transaction_id') = ? LIMIT 1",
             (transaction_id,),
         ).fetchone()
@@ -231,3 +259,28 @@ def _resolve_escalation_sync(message_id: int, resolved_by: str, resolution: str)
 
 async def resolve_escalation(message_id: int, resolved_by: str, resolution: str) -> int | None:
     return await asyncio.to_thread(_resolve_escalation_sync, message_id, resolved_by, resolution)
+
+
+def _create_csat_sync(ticket_id: int, poll_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO csat (ticket_id, poll_id, created_at) VALUES (?, ?, ?)",
+            (ticket_id, poll_id, _now()),
+        )
+
+
+async def create_csat(ticket_id: int, poll_id: str) -> None:
+    await asyncio.to_thread(_create_csat_sync, ticket_id, poll_id)
+
+
+def _record_csat_score_sync(poll_id: str, score: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE csat SET score = ?, answered_at = ? WHERE poll_id = ?",
+            (score, _now(), poll_id),
+        )
+
+
+async def record_csat_score(poll_id: str, score: int) -> None:
+    """Score is the index of the chosen option: 0 is the best outcome."""
+    await asyncio.to_thread(_record_csat_score_sync, poll_id, score)

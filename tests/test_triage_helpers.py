@@ -208,6 +208,7 @@ def _ticket_record(**overrides) -> storage.TicketRecord:
         raw_text="QR-код не появился на экране",
         transaction_id=None,
         status="open",
+        draft_reply=None,
         created_at="2026-06-20T12:00:00",
     )
     defaults.update(overrides)

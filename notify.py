@@ -1,12 +1,20 @@
+"""The staff side: a decision card in the support chat, and the buttons on it.
+
+This is the only module in the codebase that calls the refund API, and it does
+so exclusively from a callback a person tapped. The AI reaches this file with a
+recommendation and a draft reply; nothing here fires on its own.
+"""
+
 import logging
 
 from aiogram import Bot, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
+import csat
 import storage
 from api_client import PrintBoxAPIClient, PrintBoxAPIError
 from diagnosis import Evidence
-from guard_rules import Decision
+from guard_rules import Decision, RefundReview
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +23,23 @@ router = Router(name="notify")
 _CONFIRM_PREFIX = "supportbot:confirm:"
 _REJECT_PREFIX = "supportbot:reject:"
 
+_CONFIDENCE_LABELS = {"high": "высокая", "medium": "средняя", "low": "низкая"}
 
-def _escalation_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+_FALLBACK_REFUND_REPLY = (
+    "Здравствуйте! Мы проверили вашу заявку — возврат средств подтверждён, "
+    "деньги вернутся на счёт, с которого была оплата."
+)
+
+
+def _escalation_keyboard(ticket_id: int, can_refund: bool) -> InlineKeyboardMarkup:
+    if not can_refund:
+        # Refunding would be wrong or would simply fail here (see
+        # guard_rules.review_refund_case) - don't offer a button that lies.
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Закрыть без возврата", callback_data=f"{_REJECT_PREFIX}{ticket_id}")]
+            ]
+        )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -27,7 +50,9 @@ def _escalation_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def _format_escalation_text(ticket_id: int, evidence: Evidence, decision: Decision) -> str:
+def _format_escalation_text(
+    ticket_id: int, evidence: Evidence, decision: Decision, review: RefundReview | None = None
+) -> str:
     t = evidence.ticket
     tx = evidence.transaction
     lines = [
@@ -52,16 +77,49 @@ def _format_escalation_text(ticket_id: int, evidence: Evidence, decision: Decisi
         + (f", ошибка: {evidence.printer_error_text}" if evidence.printer_error_text else "")
         + (f", активный алерт: {evidence.apparat_active_alert}" if evidence.apparat_active_alert else ""),
         "",
-        f"🤖 {decision.staff_summary or decision.reason}",
-        "",
-        f"Исходное сообщение юзера: {t.raw_text}",
     ]
+
+    if decision.action == "recommend_refund":
+        confidence = _CONFIDENCE_LABELS.get(decision.confidence or "low", decision.confidence or "?")
+        lines.append(f"🤖 Рекомендую возврат · уверенность: {confidence}")
+        lines.append(decision.reason)
+    else:
+        lines.append(f"🤖 {decision.staff_summary or decision.reason}")
+
+    if review and review.blockers:
+        lines.append("")
+        lines.append("🚫 Возврат подтвердить нельзя:")
+        lines.extend(f"• {label}" for label in review.blocker_labels)
+    if review and review.warnings:
+        lines.append("")
+        lines.append("⚠️ Обратите внимание:")
+        lines.extend(f"• {label}" for label in review.warning_labels)
+
+    if decision.draft_reply:
+        lines.append("")
+        lines.append("✉️ Отправим юзеру после подтверждения:")
+        lines.append(f"«{decision.draft_reply}»")
+
+    lines.append("")
+    lines.append(f"Исходное сообщение юзера: {t.raw_text}")
     return "\n".join(lines)
 
 
-async def send_escalation(bot: Bot, staff_chat_id: int, ticket_id: int, evidence: Evidence, decision: Decision) -> int:
-    text = _format_escalation_text(ticket_id, evidence, decision)
-    message = await bot.send_message(staff_chat_id, text, reply_markup=_escalation_keyboard(ticket_id))
+async def send_escalation(
+    bot: Bot,
+    staff_chat_id: int,
+    ticket_id: int,
+    evidence: Evidence,
+    decision: Decision,
+    review: RefundReview | None = None,
+) -> int:
+    if decision.draft_reply:
+        await storage.set_ticket_draft_reply(ticket_id, decision.draft_reply)
+    text = _format_escalation_text(ticket_id, evidence, decision, review)
+    can_refund = bool(review.can_refund) if review is not None else bool(evidence.transaction)
+    message = await bot.send_message(
+        staff_chat_id, text, reply_markup=_escalation_keyboard(ticket_id, can_refund)
+    )
     await storage.create_escalation(ticket_id, staff_chat_id, message.message_id)
     receipt_file_id = evidence.ticket.receipt_photo_file_id
     if receipt_file_id:
@@ -101,13 +159,14 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
             logger.exception("Refund failed for ticket %s", ticket_id)
             await callback.answer("Ошибка при вызове возврата в API", show_alert=True)
             return
-        await storage.record_decision(ticket_id, {}, None, None, None, "auto_refund")
-        await storage.set_ticket_status(ticket_id, "resolved_refund")
-        await bot.send_message(
-            int(ticket.telegram_id),
-            "Здравствуйте! Мы проверили вашу заявку — возврат средств подтверждён, "
-            "деньги вернутся на счёт, с которого была оплата.",
+        # The transaction_id goes into the evidence blob so was_already_refunded()
+        # can find this refund later - it's the only place refunds are recorded.
+        await storage.record_decision(
+            ticket_id, {"transaction_id": ticket.transaction_id}, None, None, None, "refund_confirmed"
         )
+        await storage.set_ticket_status(ticket_id, "resolved_refund")
+        await bot.send_message(int(ticket.telegram_id), ticket.draft_reply or _FALLBACK_REFUND_REPLY)
+        await csat.send_poll(bot, int(ticket.telegram_id), ticket_id)
         new_text = callback.message.text + f"\n\n✅ Возврат подтверждён ({staff_name})"
     else:
         await storage.set_ticket_status(ticket_id, "resolved_rejected")

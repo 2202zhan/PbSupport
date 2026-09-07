@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    ReactionTypeEmoji,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -20,6 +21,7 @@ from aiogram.types import (
 import advice
 import ai_decider
 import concierge
+import csat
 import diagnosis
 import notify
 import receipt_parser
@@ -28,7 +30,7 @@ import storage
 import tz
 from api_client import PrintBoxAPIClient, PrintBoxAPIError
 from config import settings
-from guard_rules import Decision, apply_guards
+from guard_rules import Decision, RefundReview, review_refund_case
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +55,6 @@ _PROBLEM_LABELS = {
 _DESCRIPTION_PROMPTS = {
     "other": "Опишите своими словами, что случилось — я разберусь.",
 }
-
-_REFUND_PENDING_GUARDS = {"auto_refund_disabled", "amount_above_hard_cap"}
 
 # Structured intake for the technical categories - buttons cover the common answers,
 # with a "свой ответ" escape hatch for everything else, so free text is the
@@ -1259,6 +1259,7 @@ async def on_description(message: Message, state: FSMContext, bot: Bot, api: Pri
     await state.update_data(ticket_id=ticket_id, dialogue_history=ticket_input.dialogue_history)
     await state.set_state(TicketFlow.in_dialogue)
     sessions.touch(ticket_input.telegram_id)
+    await _acknowledge(bot, message)
     await _run_decision_cycle(bot, api, state, message, ticket_id, ticket_input)
 
 
@@ -1325,8 +1326,8 @@ async def _run_decision_cycle(
         await _handle_no_matching_order(bot, api, state, message, ticket_id, ticket_input, evidence)
         return
 
-    ai_decision = await ai_decider.decide(evidence)
-    final_decision, guard_triggered = apply_guards(evidence, ai_decision)
+    decision = await ai_decider.decide(evidence)
+    review = review_refund_case(evidence) if decision.action == "recommend_refund" else None
 
     if status_message is not None:
         await status_message.edit_text(f"🔍 Заявка #{ticket_id}\n✅ Анализ завершён")
@@ -1334,25 +1335,29 @@ async def _run_decision_cycle(
     await storage.record_decision(
         ticket_id,
         evidence.to_dict(),
-        ai_decision.action,
-        ai_decision.reason,
-        guard_triggered,
-        final_decision.action,
+        decision.action,
+        decision.reason,
+        ",".join(review.blockers) if review and review.blockers else None,
+        decision.action,
     )
 
-    if final_decision.action == "auto_refund":
-        await _execute_refund(bot, api, message, ticket_id, evidence, final_decision)
+    if decision.action == "recommend_refund":
+        # The AI never refunds - this hands staff a prepared case to approve.
+        await message.answer(
+            _refund_pending_message(ticket_id), reply_markup=_main_menu_keyboard()
+        )
+        await _escalate(bot, api, message, ticket_id, evidence, decision, review)
         sessions.forget(ticket_input.telegram_id)
         await state.clear()
-    elif final_decision.action in ("give_advice", "ask_clarifying_question"):
-        is_advice = final_decision.action == "give_advice"
+    elif decision.action in ("give_advice", "ask_clarifying_question"):
+        is_advice = decision.action == "give_advice"
         await message.answer(
-            final_decision.user_message,
+            decision.user_message,
             reply_markup=_feedback_keyboard(ticket_id) if is_advice else _cancel_keyboard(),
         )
         data = await state.get_data()
         dialogue_history = data.get("dialogue_history", [])
-        dialogue_history.append(f"bot: {final_decision.user_message}")
+        dialogue_history.append(f"bot: {decision.user_message}")
         rounds = data.get("rounds", 0) + 1
         await state.update_data(rounds=rounds, dialogue_history=dialogue_history)
         sessions.touch(ticket_input.telegram_id)
@@ -1366,10 +1371,8 @@ async def _run_decision_cycle(
             sessions.forget(ticket_input.telegram_id)
             await state.clear()
     else:
-        await message.answer(
-            _escalate_user_message(ticket_id, guard_triggered), reply_markup=_main_menu_keyboard()
-        )
-        await _escalate(bot, api, message, ticket_id, evidence, final_decision)
+        await message.answer(_escalate_user_message(ticket_id), reply_markup=_main_menu_keyboard())
+        await _escalate(bot, api, message, ticket_id, evidence, decision)
         sessions.forget(ticket_input.telegram_id)
         await state.clear()
 
@@ -1429,43 +1432,48 @@ async def _handle_no_matching_order(
     sessions.touch(ticket_input.telegram_id)
 
 
-def _escalate_user_message(ticket_id: int, guard_triggered: str | None) -> str:
-    if guard_triggered in _REFUND_PENDING_GUARDS:
-        return (
-            f"🟠 Заявка #{ticket_id}: нашёл признаки технической ошибки, передал сотруднику "
-            "на подтверждение возврата — отвечу здесь, как только решат."
+async def _acknowledge(bot: Bot, message: Message) -> None:
+    """A 👀 on the user's own message instead of another "принято в обработку"
+    line - quieter, and it stays attached to what it acknowledges. Best-effort:
+    reactions can be unavailable, and that must not derail the ticket."""
+    try:
+        await bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reaction=[ReactionTypeEmoji(emoji="👀")],
         )
+    except Exception:
+        logger.debug("could not react to message %s", message.message_id, exc_info=True)
+
+
+def _refund_pending_message(ticket_id: int) -> str:
+    return (
+        f"🟠 Заявка #{ticket_id}: нашёл признаки технической ошибки и подготовил возврат — "
+        "его подтверждает сотрудник, отвечу здесь, как только решение будет."
+    )
+
+
+def _escalate_user_message(ticket_id: int) -> str:
     return (
         f"🟡 Заявка #{ticket_id}: ситуация неоднозначная, нужен взгляд человека — уже "
         "передал ему все детали, отвечу здесь."
     )
 
 
-async def _execute_refund(
-    bot: Bot, api: PrintBoxAPIClient, message: Message, ticket_id: int, evidence, decision: Decision
+async def _escalate(
+    bot: Bot,
+    api: PrintBoxAPIClient,
+    message: Message,
+    ticket_id: int,
+    evidence,
+    decision: Decision,
+    review: RefundReview | None = None,
 ) -> None:
-    try:
-        await api.refund_transaction(evidence.transaction.id)
-    except PrintBoxAPIError:
-        logger.exception("refund call failed for ticket %s", ticket_id)
-        await _escalate(
-            bot, api, message, ticket_id, evidence,
-            Decision(action="escalate", reason="refund_api_failed",
-                     staff_summary=f"ИИ решил оформить возврат ({decision.reason}), но вызов API возврата упал."),
-        )
-        return
-    await storage.set_ticket_status(ticket_id, "resolved_refund")
-    await message.answer(
-        f"🟢 Заявка #{ticket_id}: мы проверили — действительно произошла техническая "
-        "ошибка. Возврат средств оформлен, деньги вернутся на счёт, с которого была оплата.",
-        reply_markup=_main_menu_keyboard(),
-    )
-
-
-async def _escalate(bot: Bot, api: PrintBoxAPIClient, message: Message, ticket_id: int, evidence, decision: Decision) -> None:
     await storage.set_ticket_status(ticket_id, "escalated")
     if evidence is not None:
-        await notify.send_escalation(bot, settings.support_staff_chat_id, ticket_id, evidence, decision)
+        await notify.send_escalation(
+            bot, settings.support_staff_chat_id, ticket_id, evidence, decision, review
+        )
     else:
         # No Evidence object here (scripted reply, or diagnosis failed before
         # one was built) - pull whatever we already stored for this ticket so
@@ -1504,6 +1512,7 @@ async def on_feedback(callback: CallbackQuery, state: FSMContext, bot: Bot, api:
         await callback.message.edit_text(
             callback.message.text + "\n\n👍 Рад был помочь!", reply_markup=_main_menu_keyboard()
         )
+        await csat.send_poll(bot, callback.from_user.id, ticket_id)
         sessions.forget(telegram_id)
         await state.clear()
     else:
@@ -1553,6 +1562,7 @@ async def on_nothelped_detail_provided(
         await status_message.edit_text("🤔 Думаю над вашим ответом...\n✅ Готово")
         await storage.set_ticket_status(ticket_id, "resolved_advice")
         await message.answer(followup.reply_text, reply_markup=_main_menu_keyboard())
+        await csat.send_poll(bot, message.from_user.id, ticket_id)
         sessions.forget(telegram_id)
         await state.clear()
         return
