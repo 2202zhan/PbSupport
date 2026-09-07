@@ -79,7 +79,10 @@ async def test_first_confirm_refunds_and_removes_buttons():
     set_status_mock.assert_called_once_with(1, "resolved_refund")
     callback.message.edit_text.assert_called_once()
     _, kwargs = callback.message.edit_text.call_args
-    assert kwargs.get("reply_markup") is None
+    # Refund/reject are gone so nobody taps them twice, but staff keep a way to
+    # write to the user afterwards.
+    callbacks = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert callbacks == [f"{notify._REPLY_PREFIX}1"]
 
 
 async def test_confirm_sends_the_ai_draft_reply_to_the_user():
@@ -248,3 +251,51 @@ def test_plain_escalation_falls_back_when_ticket_not_found():
     decision = Decision(action="escalate", reason="diagnosis_failed", staff_summary="Не удалось собрать диагностику.")
     text = notify.format_plain_escalation_text(12, None, decision)
     assert text == "🆘 Заявка #12 - Не удалось собрать диагностику."
+
+
+async def test_rejection_tells_the_user_the_case_is_closed():
+    # Silence after "передал сотруднику, отвечу здесь" reads as being ignored.
+    callback = _fake_callback(f"{notify._REJECT_PREFIX}1")
+    bot = AsyncMock()
+    api = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket())), \
+         patch.object(storage, "resolve_escalation", AsyncMock()), \
+         patch.object(storage, "set_ticket_status", AsyncMock()):
+        await notify.handle_escalation_decision(callback, bot, api)
+
+    bot.send_message.assert_called_once()
+    args, _ = bot.send_message.call_args
+    assert args[0] == 123
+    assert "#1" in args[1]
+
+
+async def test_rejection_without_a_payment_points_at_the_receipt_route():
+    # Nothing was found to refund - the useful next step is a fresh request
+    # with a receipt, not "describe it again".
+    callback = _fake_callback(f"{notify._REJECT_PREFIX}1")
+    bot = AsyncMock()
+    api = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket(transaction_id=None))), \
+         patch.object(storage, "resolve_escalation", AsyncMock()), \
+         patch.object(storage, "set_ticket_status", AsyncMock()):
+        await notify.handle_escalation_decision(callback, bot, api)
+
+    args, _ = bot.send_message.call_args
+    assert "чек" in args[1].lower()
+
+
+async def test_rejection_still_completes_if_the_user_blocked_the_bot():
+    callback = _fake_callback(f"{notify._REJECT_PREFIX}1")
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(side_effect=RuntimeError("bot was blocked"))
+    api = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket())), \
+         patch.object(storage, "resolve_escalation", AsyncMock()), \
+         patch.object(storage, "set_ticket_status", AsyncMock()) as status_mock:
+        await notify.handle_escalation_decision(callback, bot, api)
+
+    status_mock.assert_called_once_with(1, "resolved_rejected")
+    callback.message.edit_text.assert_called_once()

@@ -52,6 +52,24 @@ _RECEIPT_REQUEST_TEMPLATE = (
     "закончить проверку. Пришлите, пожалуйста, фото или PDF чека прямо сюда."
 )
 
+# A rejection has to reach the user too - the bot promised "отвечу здесь", and
+# silence after that reads as being ignored. Two wordings, because "we couldn't
+# find your payment at all" and "we found it and saw no fault" are different
+# news and deserve different next steps.
+_REJECTED_NO_PAYMENT_TEMPLATE = (
+    "🔍 Заявка #{ticket_id} закрыта: подтвердить оплату по этому заказу не удалось, "
+    "поэтому оформить возврат мы не можем.\n\n"
+    "Если у вас сохранился чек — отправьте /start и создайте обращение заново, приложив "
+    "его. С чеком мы сможем найти платёж, даже если он был с другого аккаунта."
+)
+
+_REJECTED_TEMPLATE = (
+    "🔍 Заявка #{ticket_id} закрыта: мы проверили — технической ошибки с нашей стороны "
+    "не нашли, поэтому возврат по ней не оформляем.\n\n"
+    "Если считаете, что это ошибка, отправьте /start и опишите ситуацию подробнее — "
+    "посмотрим ещё раз."
+)
+
 # Threads where a staff member tapped "Ответить" and their next message should
 # go to the user. Deliberately in memory: it lives for seconds, and losing it
 # on restart just means the message isn't relayed - nothing breaks.
@@ -301,9 +319,25 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
         new_text = callback.message.text + f"\n\n✅ Возврат подтверждён ({staff_name})"
     else:
         await storage.set_ticket_status(ticket_id, "resolved_rejected")
+        template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
+        try:
+            await bot.send_message(
+                int(ticket.telegram_id), template.format(ticket_id=ticket_id)
+            )
+        except Exception:
+            logger.exception("could not tell the user ticket %s was rejected", ticket_id)
         new_text = callback.message.text + f"\n\n❌ Отклонено ({staff_name})"
 
-    await callback.message.edit_text(new_text, reply_markup=None)
+    # The refund decision is final, but the conversation isn't: staff keep the
+    # reply button so they can explain a rejection in their own words.
+    await callback.message.edit_text(
+        new_text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"{_REPLY_PREFIX}{ticket_id}")]
+            ]
+        ),
+    )
     _awaiting_staff_reply.discard(ticket.forum_topic_id)
     await _close_topic(bot, settings.support_staff_chat_id, ticket.forum_topic_id)
     await callback.answer()
@@ -349,6 +383,13 @@ async def handle_reply_request(callback: CallbackQuery, bot: Bot) -> None:
             show_alert=True,
         )
         return
+
+    # The thread is closed once the case is resolved, and a closed topic only
+    # accepts messages from admins - reopen it so anyone on shift can type.
+    try:
+        await bot.reopen_forum_topic(settings.support_staff_chat_id, ticket.forum_topic_id)
+    except Exception:
+        logger.debug("topic %s was already open", ticket.forum_topic_id, exc_info=True)
 
     _awaiting_staff_reply.add(ticket.forum_topic_id)
     await bot.send_message(
