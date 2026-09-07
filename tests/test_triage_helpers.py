@@ -197,49 +197,6 @@ class _FakeApparat:
         self.status = "online"
 
 
-def _ticket_record(**overrides) -> storage.TicketRecord:
-    defaults = dict(
-        id=12,
-        telegram_id="943402384",
-        username="Niidaime",
-        contact="+77001234567",
-        problem_type="payment_error",
-        apparat_name="Аппарат №1",
-        raw_text="QR-код не появился на экране",
-        transaction_id=None,
-        status="open",
-        draft_reply=None,
-        created_at="2026-06-20T12:00:00",
-    )
-    defaults.update(overrides)
-    return storage.TicketRecord(**defaults)
-
-
-def test_format_plain_escalation_includes_ticket_details():
-    decision = Decision(action="escalate", reason="advice_not_helpful", staff_summary="Совет ИИ не помог юзеру.")
-    text = triage._format_plain_escalation_text(12, _ticket_record(), decision)
-    assert "Аппарат №1" in text
-    assert "943402384" in text
-    assert "@Niidaime" in text
-    assert "+77001234567" in text
-    assert "QR-код не появился на экране" in text
-    assert "Совет ИИ не помог юзеру." in text
-
-
-def test_format_plain_escalation_handles_missing_optional_fields():
-    decision = Decision(action="escalate", reason="advice_not_helpful", staff_summary="Совет ИИ не помог юзеру.")
-    record = _ticket_record(username=None, contact=None, raw_text=None)
-    text = triage._format_plain_escalation_text(12, record, decision)
-    assert "Юзернейм: -" in text
-    assert "Контакт: -" in text
-
-
-def test_format_plain_escalation_falls_back_when_ticket_not_found():
-    decision = Decision(action="escalate", reason="diagnosis_failed", staff_summary="Не удалось собрать диагностику.")
-    text = triage._format_plain_escalation_text(12, None, decision)
-    assert text == "🆘 Заявка #12 - Не удалось собрать диагностику."
-
-
 def test_resolve_phone_input_prefers_shared_contact():
     assert triage._resolve_phone_input("+77001234567", "не подставится") == "+77001234567"
 

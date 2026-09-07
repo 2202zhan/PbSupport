@@ -4,7 +4,7 @@ import re
 from datetime import timedelta
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -35,6 +35,11 @@ from guard_rules import Decision, RefundReview, review_refund_case
 logger = logging.getLogger(__name__)
 
 router = Router(name="triage")
+# Everything in this module talks to one user in their own chat. Without this,
+# the catch-all at the bottom would also answer every staff message in the
+# support group - and once privacy mode is off there, that means running the
+# concierge model on staff chatter. Callback queries are unaffected.
+router.message.filter(F.chat.type == "private")
 
 _MAX_AI_ROUNDS = 3
 # Deliberately paced (not just "as fast as the API responds") so the staged
@@ -934,9 +939,7 @@ async def _extract_receipt_data(
 
 
 async def _forward_receipt_to_staff(bot: Bot, ticket_id: int, file_id: str, is_document: bool) -> None:
-    caption = f"📎 Чек к заявке #{ticket_id}"
-    send = bot.send_document if is_document else bot.send_photo
-    await send(settings.support_staff_chat_id, file_id, caption=caption)
+    await notify.forward_receipt(bot, ticket_id, file_id, is_document)
 
 
 @router.message(TicketFlow.awaiting_receipt_photo, F.photo | F.document)
@@ -1476,29 +1479,9 @@ async def _escalate(
         )
     else:
         # No Evidence object here (scripted reply, or diagnosis failed before
-        # one was built) - pull whatever we already stored for this ticket so
-        # staff still get apparat/contact/the original complaint, not just one
-        # bare line they'd have to look the ticket up manually to act on.
-        ticket_record = await storage.get_ticket(ticket_id)
-        await bot.send_message(settings.support_staff_chat_id, _format_plain_escalation_text(ticket_id, ticket_record, decision))
-
-
-def _format_plain_escalation_text(ticket_id: int, ticket_record, decision: Decision) -> str:
-    if ticket_record is None:
-        return f"🆘 Заявка #{ticket_id} - {decision.staff_summary or decision.reason}"
-    lines = [
-        f"🆘 Заявка #{ticket_id}",
-        f"Аппарат: {ticket_record.apparat_name or '-'}",
-        f"Категория: {_PROBLEM_LABELS.get(ticket_record.problem_type, ticket_record.problem_type)}",
-        f"Telegram ID: {ticket_record.telegram_id}",
-        f"Юзернейм: @{ticket_record.username}" if ticket_record.username else "Юзернейм: -",
-        f"Контакт: {ticket_record.contact or '-'}",
-        "",
-        f"🤖 {decision.staff_summary or decision.reason}",
-        "",
-        f"Исходное сообщение юзера: {ticket_record.raw_text or '-'}",
-    ]
-    return "\n".join(lines)
+        # one was built) - notify still pulls what we stored for this ticket so
+        # staff get apparat/contact/the original complaint, not one bare line.
+        await notify.send_plain_escalation(bot, settings.support_staff_chat_id, ticket_id, decision)
 
 
 @router.callback_query(F.data.startswith("feedback:"))
@@ -1722,6 +1705,34 @@ async def on_followup_message(message: Message, state: FSMContext, bot: Bot, api
     await state.update_data(dialogue_history=dialogue_history)
     sessions.touch(ticket_input.telegram_id)
     await _run_decision_cycle(bot, api, state, message, ticket_id, ticket_input)
+
+
+@router.message(StateFilter(None), F.photo | F.document)
+async def on_requested_receipt(message: Message, bot: Bot) -> None:
+    """A receipt arriving out of the blue, with no active flow - this happens
+    when staff tapped "Запросить чек" and the user answers later, long after
+    their session was cleared. Without this the photo would fall through to the
+    concierge, which has no idea a ticket is waiting for it."""
+    telegram_id = str(message.from_user.id)
+    ticket = await storage.find_ticket_awaiting_receipt(telegram_id)
+    if ticket is None:
+        await message.answer(
+            "Если это чек по заявке — начните, пожалуйста, с /start, так я смогу его привязать.",
+            reply_markup=_main_menu_keyboard(),
+        )
+        return
+
+    file_id, is_document, _ = await _extract_receipt_data(bot, message)
+    if not file_id:
+        await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
+        return
+
+    await notify.forward_receipt(bot, ticket.id, file_id, is_document)
+    await storage.set_ticket_status(ticket.id, "escalated")
+    await message.answer(
+        f"Спасибо! Передал чек сотруднику по заявке #{ticket.id} — вернусь с ответом сюда.",
+        reply_markup=_main_menu_keyboard(),
+    )
 
 
 _UNKNOWN_COMMAND_REPLY = (

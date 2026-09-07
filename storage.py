@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     transaction_id TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     draft_reply TEXT,
+    forum_topic_id INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -79,6 +80,8 @@ def init_db() -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(tickets)")}
         if "draft_reply" not in existing:
             conn.execute("ALTER TABLE tickets ADD COLUMN draft_reply TEXT")
+        if "forum_topic_id" not in existing:
+            conn.execute("ALTER TABLE tickets ADD COLUMN forum_topic_id INTEGER")
 
 
 @dataclass
@@ -93,6 +96,7 @@ class TicketRecord:
     transaction_id: str | None
     status: str
     draft_reply: str | None
+    forum_topic_id: int | None
     created_at: str
 
 
@@ -173,6 +177,48 @@ def _set_ticket_draft_reply_sync(ticket_id: int, draft_reply: str) -> None:
 async def set_ticket_draft_reply(ticket_id: int, draft_reply: str) -> None:
     """The message the AI prepared for the user, sent only if staff approve."""
     await asyncio.to_thread(_set_ticket_draft_reply_sync, ticket_id, draft_reply)
+
+
+def _set_ticket_topic_sync(ticket_id: int, forum_topic_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE tickets SET forum_topic_id = ? WHERE id = ?", (forum_topic_id, ticket_id)
+        )
+
+
+async def set_ticket_topic(ticket_id: int, forum_topic_id: int) -> None:
+    await asyncio.to_thread(_set_ticket_topic_sync, ticket_id, forum_topic_id)
+
+
+def _get_ticket_by_topic_sync(forum_topic_id: int) -> TicketRecord | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE forum_topic_id = ? ORDER BY id DESC LIMIT 1",
+            (forum_topic_id,),
+        ).fetchone()
+        return TicketRecord(**dict(row)) if row else None
+
+
+async def get_ticket_by_topic(forum_topic_id: int) -> TicketRecord | None:
+    """Maps a staff message in a forum thread back to the ticket it belongs to."""
+    return await asyncio.to_thread(_get_ticket_by_topic_sync, forum_topic_id)
+
+
+def _find_ticket_awaiting_receipt_sync(telegram_id: str) -> TicketRecord | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE telegram_id = ? AND status = 'awaiting_receipt' "
+            "ORDER BY id DESC LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        return TicketRecord(**dict(row)) if row else None
+
+
+async def find_ticket_awaiting_receipt(telegram_id: str) -> TicketRecord | None:
+    """Staff asked this user for a receipt, possibly hours ago and long after
+    their chat session was cleared - this is how an out-of-the-blue photo gets
+    attached to the right ticket."""
+    return await asyncio.to_thread(_find_ticket_awaiting_receipt_sync, telegram_id)
 
 
 def _record_decision_sync(

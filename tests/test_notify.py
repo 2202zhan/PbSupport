@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 import csat
 import notify
 import storage
+from guard_rules import Decision
 
 
 def _fake_callback(data: str, message_text: str = "🆘 Заявка #1\n...") -> AsyncMock:
@@ -21,12 +22,13 @@ def _fake_ticket(
     status: str = "escalated",
     transaction_id: str | None = "tx-1",
     draft_reply: str | None = None,
+    forum_topic_id: int | None = None,
 ) -> storage.TicketRecord:
     return storage.TicketRecord(
         id=1, telegram_id="123", username="user", contact=None,
         problem_type="not_printed", apparat_name="Аппарат №1", raw_text="не печатает",
         transaction_id=transaction_id, status=status, draft_reply=draft_reply,
-        created_at="2026-06-29T12:00:00",
+        forum_topic_id=forum_topic_id, created_at="2026-06-29T12:00:00",
     )
 
 
@@ -135,12 +137,114 @@ async def test_confirm_records_the_refund_against_its_transaction():
 
 def test_blocked_case_offers_no_refund_button():
     keyboard = notify._escalation_keyboard(1, can_refund=False)
-    labels = [b.text for row in keyboard.inline_keyboard for b in row]
-    assert not any("возврат" in label.lower() and "подтвердить" in label.lower() for label in labels)
-    assert len(labels) == 1
+    callbacks = [b.callback_data for row in keyboard.inline_keyboard for b in row]
+    assert not any(c.startswith(notify._CONFIRM_PREFIX) for c in callbacks)
+    # Asking for a receipt and replying still make sense on a blocked case -
+    # that's often exactly how the blocker gets resolved.
+    assert any(c.startswith(notify._ASK_RECEIPT_PREFIX) for c in callbacks)
+    assert any(c.startswith(notify._REPLY_PREFIX) for c in callbacks)
 
 
-def test_clean_case_offers_both_buttons():
+def test_clean_case_offers_all_four_actions():
     keyboard = notify._escalation_keyboard(1, can_refund=True)
     callbacks = [b.callback_data for row in keyboard.inline_keyboard for b in row]
-    assert callbacks == [f"{notify._CONFIRM_PREFIX}1", f"{notify._REJECT_PREFIX}1"]
+    assert callbacks == [
+        f"{notify._CONFIRM_PREFIX}1",
+        f"{notify._REJECT_PREFIX}1",
+        f"{notify._ASK_RECEIPT_PREFIX}1",
+        f"{notify._REPLY_PREFIX}1",
+    ]
+
+
+def test_topic_title_names_the_case():
+    title = notify._topic_title(31, "not_printed", "Аппарат №1")
+    assert title == "#31 · не печатает · Аппарат №1"
+
+
+def test_topic_title_stays_within_telegram_limit():
+    title = notify._topic_title(31, "not_printed", "А" * 300)
+    assert len(title) <= 128
+
+
+async def test_ask_receipt_writes_to_the_user_and_marks_the_ticket():
+    callback = _fake_callback(f"{notify._ASK_RECEIPT_PREFIX}1")
+    bot = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket(forum_topic_id=42))), \
+         patch.object(storage, "set_ticket_status", AsyncMock()) as status_mock:
+        await notify.handle_ask_receipt(callback, bot)
+
+    user_message = bot.send_message.call_args_list[0]
+    assert user_message.args[0] == 123  # the user, not the staff chat
+    status_mock.assert_called_once_with(1, "awaiting_receipt")
+
+
+async def test_ask_receipt_does_not_mark_the_ticket_if_the_user_is_unreachable():
+    # Blocked bot, deleted account - marking it "awaiting_receipt" would leave
+    # the ticket waiting for something that was never asked for.
+    callback = _fake_callback(f"{notify._ASK_RECEIPT_PREFIX}1")
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(side_effect=RuntimeError("bot was blocked"))
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket())), \
+         patch.object(storage, "set_ticket_status", AsyncMock()) as status_mock:
+        await notify.handle_ask_receipt(callback, bot)
+
+    status_mock.assert_not_called()
+    assert callback.answer.call_args.kwargs.get("show_alert") is True
+
+
+async def test_staff_reply_is_relayed_only_after_the_button():
+    message = AsyncMock()
+    message.message_thread_id = 42
+    message.text = "Проверили вручную, деньги вернём завтра."
+    bot = AsyncMock()
+
+    notify._awaiting_staff_reply.discard(42)
+    with patch.object(storage, "get_ticket_by_topic", AsyncMock(return_value=_fake_ticket())) as lookup:
+        await notify.relay_staff_reply(message, bot)
+    lookup.assert_not_called()  # nobody tapped "Ответить" - this was staff chatter
+
+    notify._awaiting_staff_reply.add(42)
+    with patch.object(storage, "get_ticket_by_topic", AsyncMock(return_value=_fake_ticket())):
+        await notify.relay_staff_reply(message, bot)
+    bot.send_message.assert_called_once()
+    assert message.text in bot.send_message.call_args.args[1]
+    # One tap, one relayed message - the next line of discussion stays internal.
+    assert 42 not in notify._awaiting_staff_reply
+
+
+def _plain_ticket(**overrides) -> storage.TicketRecord:
+    defaults = dict(
+        id=12, telegram_id="943402384", username="Niidaime", contact="+77001234567",
+        problem_type="payment_error", apparat_name="Аппарат №1",
+        raw_text="QR-код не появился на экране", transaction_id=None, status="open",
+        draft_reply=None, forum_topic_id=None, created_at="2026-06-20T12:00:00",
+    )
+    defaults.update(overrides)
+    return storage.TicketRecord(**defaults)
+
+
+def test_plain_escalation_includes_ticket_details():
+    decision = Decision(action="escalate", reason="advice_not_helpful", staff_summary="Совет ИИ не помог юзеру.")
+    text = notify.format_plain_escalation_text(12, _plain_ticket(), decision)
+    assert "Аппарат №1" in text
+    assert "943402384" in text
+    assert "@Niidaime" in text
+    assert "+77001234567" in text
+    assert "QR-код не появился на экране" in text
+    assert "Совет ИИ не помог юзеру." in text
+
+
+def test_plain_escalation_handles_missing_optional_fields():
+    decision = Decision(action="escalate", reason="advice_not_helpful", staff_summary="Совет ИИ не помог юзеру.")
+    record = _plain_ticket(username=None, contact=None, raw_text=None)
+    text = notify.format_plain_escalation_text(12, record, decision)
+    assert "Юзернейм: -" in text
+    assert "Контакт: -" in text
+
+
+def test_plain_escalation_falls_back_when_ticket_not_found():
+    decision = Decision(action="escalate", reason="diagnosis_failed", staff_summary="Не удалось собрать диагностику.")
+    text = notify.format_plain_escalation_text(12, None, decision)
+    assert text == "🆘 Заявка #12 - Не удалось собрать диагностику."
