@@ -48,11 +48,15 @@ class Apparat:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Apparat":
+        # v2 reports health as is_online rather than a status string.
+        status = data.get("status")
+        if status is None and "is_online" in data:
+            status = "online" if data["is_online"] else "offline"
         return cls(
             id=data["id"],
             name_apparat=data["name_apparat"],
             address=data.get("address", ""),
-            status=data.get("status", ""),
+            status=status or "",
         )
 
 
@@ -147,9 +151,12 @@ class PrintBoxAPIClient:
         return resp.json()
 
     async def get_apparats(self) -> list[Apparat]:
-        resp = await self._request("GET", "/v1/admin/apparats")
-        data = resp.json()
-        return [Apparat.from_dict(a) for a in data["data"]]
+        # /v1/admin/apparats started returning 403 (access tightened server-side);
+        # v2 carries the same machines under a doubly-nested "apparats" key.
+        resp = await self._request("GET", "/v2/admin/apparats")
+        data = resp.json()["apparats"]
+        items = data["apparats"] if isinstance(data, dict) else data
+        return [Apparat.from_dict(a) for a in items]
 
     async def get_printer_history(
         self, apparat_id: int, limit: int = 50, offset: int = 0
@@ -210,6 +217,3 @@ class PrintBoxAPIClient:
             for f in data.get("files", [])
         ]
 
-    async def get_document_status(self, document_id: int) -> dict[str, Any]:
-        resp = await self._request("GET", f"/v1/telegram/document/{document_id}/status")
-        return resp.json()

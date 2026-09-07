@@ -430,12 +430,19 @@ def _escalation_receipt_keyboard() -> InlineKeyboardMarkup:
 
 
 async def _apparat_keyboard(api: PrintBoxAPIClient) -> InlineKeyboardMarkup:
-    apparats = await api.get_apparats()
+    """A failure here must still leave the user a way forward: they can always
+    type the apparat name, and the ticket carries that text either way."""
+    try:
+        apparats = await api.get_apparats()
+    except PrintBoxAPIError:
+        logger.exception("could not list apparats")
+        apparats = []
     rows = [
         [InlineKeyboardButton(text=a.name_apparat, callback_data=f"apparat:{a.name_apparat}")]
         for a in apparats
     ]
-    rows.append([InlineKeyboardButton(text="Не вижу свой аппарат", callback_data="apparat:__other__")])
+    label = "Не вижу свой аппарат" if apparats else "Указать аппарат вручную"
+    rows.append([InlineKeyboardButton(text=label, callback_data="apparat:__other__")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
