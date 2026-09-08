@@ -314,8 +314,9 @@ async def test_description_handles_voice_instead_of_text():
 
 async def test_nothelped_detail_handles_voice_instead_of_text():
     message = _FakeMessage(None)
-    await triage.on_nothelped_detail_provided(message, state=None, bot=None)
-    assert message.answered_with == ["Пожалуйста, напишите текстом, что именно не так."]
+    await triage.on_nothelped_detail_provided(message, state=None, bot=None, api=None)
+    assert len(message.answered_with) == 1
+    assert "словами" in message.answered_with[0]
 
 
 def test_every_user_facing_prompt_forbids_self_service_advice():
@@ -407,7 +408,7 @@ async def test_pre_payment_complaint_skips_the_receipt_question(monkeypatch):
 
     message = _RecordingMessage("оплата кюар ыстемид")
     await triage.on_nothelped_detail_provided(
-        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
     )
 
     assert reached_phone == [True]
@@ -419,7 +420,7 @@ async def test_paid_complaint_still_asks_for_the_receipt(monkeypatch):
 
     message = _RecordingMessage("деньги списались, ничего не вышло")
     await triage.on_nothelped_detail_provided(
-        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
     )
 
     assert any("чек" in t.lower() for t in message.answered_with)
@@ -442,34 +443,44 @@ class _TonerApi:
         return [{"apparat_id": 1, "is_online": True, "error_text": None, "toner": self.toner}]
 
 
-async def test_low_toner_is_reported_to_staff():
-    reply, tell_staff = await triage._faded_print_reply(_TonerApi({"black": 4}), "Аппарат №1")
-    assert tell_staff is True
-    assert "4%" in reply
+async def test_low_toner_reaches_staff_with_the_figure():
+    reply, staff_summary = await triage._faded_print_reply(_TonerApi({"black": 4}), "Аппарат №1")
+    assert "4%" in staff_summary
+    assert "исходе" in reply
 
 
-async def test_healthy_toner_is_not_reported_to_staff():
-    reply, tell_staff = await triage._faded_print_reply(_TonerApi({"black": 80}), "Аппарат №1")
-    assert tell_staff is False
-    assert "80%" in reply
+async def test_healthy_toner_still_reaches_staff():
+    # The machine printing faded on a full cartridge is exactly the case a
+    # human has to look at - "тонера достаточно" is not an answer on its own.
+    reply, staff_summary = await triage._faded_print_reply(_TonerApi({"black": 80}), "Аппарат №1")
+    assert "80%" in staff_summary
+    assert "в порядке" in reply
+    assert "ещё раз" in reply
 
 
-async def test_unreadable_toner_does_not_guess():
-    reply, tell_staff = await triage._faded_print_reply(_TonerApi(raise_=True), "Аппарат №1")
-    assert tell_staff is False
-    assert "не могу проверить" in reply
+async def test_unreadable_toner_neither_guesses_nor_confesses():
+    # The user gets a real next step, not a report about our own blind spots.
+    reply, staff_summary = await triage._faded_print_reply(_TonerApi(raise_=True), "Аппарат №1")
+    assert staff_summary
+    assert "не могу" not in reply.lower()
+    assert "замечание принял" in reply.lower()
 
 
-async def test_only_the_branch_that_escalates_claims_it_did():
-    # The recurring bug: a scripted reply saying "передал сотрудникам" when
-    # _send_scripted_reply notifies nobody, leaving the user waiting.
-    for api, should_notify in [(_TonerApi({"black": 4}), True), (_TonerApi({"black": 80}), False),
-                               (_TonerApi(raise_=True), False)]:
-        reply, tell_staff = await triage._faded_print_reply(api, "Аппарат №1")
-        claims = "передаю сотрудник" in reply.lower() or "передал сотрудник" in reply.lower()
-        assert claims == should_notify, reply
-    for key, reply in triage._QUALITY_REPLIES.items():
-        assert "передал сотрудник" not in reply.lower(), key
+async def test_no_branch_leaks_our_counters_to_the_user():
+    # Toner percentages are staff-side: the user is told what it means, not
+    # what our monitoring reads.
+    for api in [_TonerApi({"black": 4}), _TonerApi({"black": 80}), _TonerApi(raise_=True)]:
+        reply, _ = await triage._faded_print_reply(api, "Аппарат №1")
+        assert "%" not in reply, reply
+
+
+async def test_every_faded_print_complaint_reaches_a_human():
+    # The recurring bug was the opposite one: a scripted reply claiming
+    # "передал сотрудникам" while _send_scripted_reply notified nobody. Now
+    # every branch really does escalate, so every branch may say so.
+    for api in [_TonerApi({"black": 4}), _TonerApi({"black": 80}), _TonerApi(raise_=True)]:
+        _, staff_summary = await triage._faded_print_reply(api, "Аппарат №1")
+        assert staff_summary
 
 
 async def test_user_message_goes_to_staff_while_live_chat_is_open(monkeypatch):
@@ -713,3 +724,155 @@ async def test_unparsable_receipt_in_dialogue_still_reaches_staff(monkeypatch):
 
     assert seen["input"].receipt_photo_file_id == "photo-1"
     assert seen["input"].manual_hint_is_precise is False
+
+
+async def test_a_receipt_sent_after_not_helped_is_read_not_refused(monkeypatch):
+    # Answering "что именно не так?" with proof of payment used to hit the
+    # "напишите текстом" guard - the user had sent the most relevant thing
+    # they had and was told it didn't count.
+    import receipt_parser
+
+    ticket = _record(problem_type="print_quality", payment_expected=1)
+    _escalating_followup(monkeypatch, ticket)
+
+    async def _extract(bot, message):
+        return "file-1", True, receipt_parser.ReceiptData(
+            amount=35.0, paid_at=triage.tz.now(), receipt_number="QR1"
+        )
+
+    seen = {}
+
+    async def _decide(**kwargs):
+        seen.update(kwargs)
+        return triage.ai_decider.FollowupDecision(action="escalate", reason="r", staff_summary="s")
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.ai_decider, "decide_followup", _decide)
+
+    message = _RecordingMessage(None)
+    state = _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"})
+    await triage.on_nothelped_detail_receipt(message, state, None, None)
+
+    assert not any("текстом" in t for t in message.answered_with)
+    assert "чек" in seen["user_followup"].lower()
+    assert state._data["pending_escalation_receipt_file_id"] == "file-1"
+
+
+async def test_a_stale_receipt_after_not_helped_is_still_refused(monkeypatch):
+    import receipt_parser
+
+    async def _extract(bot, message):
+        return "file-1", True, receipt_parser.ReceiptData(
+            amount=35.0, paid_at=triage.tz.now() - timedelta(days=3), receipt_number="QR1"
+        )
+
+    refused = []
+
+    async def _refuse(message, state, ticket_id, paid_at):
+        refused.append(paid_at)
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage, "_refuse_stale_receipt", _refuse)
+
+    await triage.on_nothelped_detail_receipt(
+        _RecordingMessage(None),
+        _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}),
+        None,
+        None,
+    )
+    assert len(refused) == 1
+
+
+async def test_apparat_state_note_carries_no_figures(monkeypatch):
+    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: True)
+    ticket = _record(problem_type="print_quality", apparat_name="Аппарат №1")
+    note = await triage._apparat_state_note(_TonerApi({"black": 80}), ticket)
+    assert note and "%" not in note
+
+
+async def test_apparat_state_note_is_silent_when_the_kiosks_are_off(monkeypatch):
+    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: False)
+    ticket = _record(problem_type="print_quality", apparat_name="Аппарат №1")
+    note = await triage._apparat_state_note(_TonerApi({"black": 80}), ticket)
+    assert note and "выключены" in note
+
+
+async def test_apparat_state_note_skipped_for_a_money_ticket(monkeypatch):
+    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: True)
+    ticket = _record(problem_type="not_printed", apparat_name="Аппарат №1")
+    assert await triage._apparat_state_note(_TonerApi({"black": 80}), ticket) is None
+
+
+class _FakeCallback:
+    def __init__(self, data, user_id=884013433):
+        self.data = data
+        self.from_user = SimpleNamespace(id=user_id, username="zhan")
+        self.message = _RecordingMessage(None)
+        self.message.edited: list[str] = []
+
+        async def _edit(text, reply_markup=None):
+            self.message.edited.append(text)
+
+        self.message.edit_text = _edit
+        self.answered = False
+
+    async def answer(self, *_args, **_kwargs):
+        self.answered = True
+
+
+async def test_a_faded_print_complaint_reaches_staff_and_says_so(monkeypatch):
+    # The screenshot that started this: the user got "не могу проверить" and
+    # nobody was told. Now the machine is read, the user gets a real next step,
+    # and a card really does go out.
+    created, escalated = [], []
+
+    async def _create_ticket(**kwargs):
+        created.append(kwargs)
+        return 61
+
+    async def _record_decision(*_args):
+        return None
+
+    async def _escalate(bot, ticket_id, evidence, decision, review=None):
+        escalated.append(decision)
+
+    monkeypatch.setattr(triage.storage, "create_ticket", _create_ticket)
+    monkeypatch.setattr(triage.storage, "record_decision", _record_decision)
+    monkeypatch.setattr(triage, "_escalate", _escalate)
+
+    callback = _FakeCallback("quality:faded")
+    await triage.on_quality_chosen(
+        callback, _FakeState({"apparat_name_text": "главный корпус"}), None, _TonerApi({"black": 80})
+    )
+
+    assert len(escalated) == 1
+    reply = callback.message.answered_with[0]
+    assert "%" not in reply
+    assert "ещё раз" in reply
+    assert created[0]["problem_type"] == "print_quality"
+
+
+async def test_streaks_are_not_answered_with_a_promise_nobody_keeps(monkeypatch):
+    # The scripted answer says "передам сотрудникам" - so it has to.
+    escalated = []
+
+    async def _create_ticket(**kwargs):
+        return 62
+
+    async def _record_decision(*_args):
+        return None
+
+    async def _escalate(bot, ticket_id, evidence, decision, review=None):
+        escalated.append(decision)
+
+    monkeypatch.setattr(triage.storage, "create_ticket", _create_ticket)
+    monkeypatch.setattr(triage.storage, "record_decision", _record_decision)
+    monkeypatch.setattr(triage, "_escalate", _escalate)
+
+    callback = _FakeCallback("quality:streaks")
+    await triage.on_quality_chosen(
+        callback, _FakeState({"apparat_name_text": "Аппарат №1"}), None, _TonerApi({"black": 80})
+    )
+
+    assert len(escalated) == 1
+    assert "Передам сотрудникам" in callback.message.answered_with[0]

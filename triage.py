@@ -908,43 +908,84 @@ async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
-async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, bool]:
-    """Answers a "faded print" complaint from the apparat's real toner level.
-    The user can't act on toner either way - it's ours to refill - so the reply
-    only ever states what we found and what we're doing about it.
-
-    Returns (reply, tell_staff): a confirmed low cartridge is worth waking staff
-    for on its own, the same as a "бумага/тонер закончились" report."""
-    level = None
+async def _read_toner_level(api: PrintBoxAPIClient, apparat_name_text: str) -> int | None:
+    """Lowest cartridge level the apparat reports, or None if we couldn't ask."""
     try:
         apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
-        if apparat is not None:
-            statuses = await api.get_all_printer_statuses()
-            current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None)
-            toner = (current or {}).get("toner") or {}
-            if toner:
-                level = min(v for v in toner.values() if isinstance(v, (int, float)))
+        if apparat is None:
+            return None
+        statuses = await api.get_all_printer_statuses()
     except PrintBoxAPIError:
         logger.warning("could not read toner for %s", apparat_name_text)
+        return None
+    current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None) or {}
+    levels = [v for v in (current.get("toner") or {}).values() if isinstance(v, (int, float))]
+    return int(min(levels)) if levels else None
 
-    if level is not None and level < 20:
-        # Only this branch actually reaches staff (see on_quality_chosen), so
-        # only this branch is allowed to say so.
+
+# Statuses that mean a human already has this ticket in front of them - only
+# then may a reply say "сотрудники уже смотрят" without it being a lie.
+_WITH_STAFF_STATUSES = ("escalated", "awaiting_receipt")
+
+
+async def _apparat_state_note(
+    api: PrintBoxAPIClient, ticket: storage.TicketRecord | None
+) -> str | None:
+    """A plain-language line about the machine for the follow-up model, so it
+    answers "почему бледно печатает?" with what we actually see instead of
+    telling the user it can't check anything. No figures - the model talks to
+    the user, and our counters are staff-side."""
+    if ticket is None or not ticket.apparat_name:
+        return None
+    if ticket.problem_type not in ("print_quality", "device_issue"):
+        return None
+    if not _apparats_are_awake():
+        return "аппараты сейчас выключены (работают с 8:00 до 19:00), свежих показаний нет"
+    level = await _read_toner_level(api, ticket.apparat_name)
+    if level is None:
+        return None
+    if level < _LOW_TONER:
+        return "картридж на этом аппарате на исходе, его нужно заменить — это наша задача"
+    return "картриджа на этом аппарате достаточно, об ошибках аппарат не сообщает"
+
+
+async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
+    """Answers a "faded print" complaint from the apparat's real cartridge level.
+
+    The user can't act on toner either way - it's ours to refill - so the reply
+    only ever states what we found and what happens next. Every branch hands the
+    complaint to staff: a faded page is a machine that needs a look, whether or
+    not the cartridge is what's low. Returns (reply, staff_summary)."""
+    level = await _read_toner_level(api, apparat_name_text)
+
+    if level is not None and level < _LOW_TONER:
         return (
-            f"🌫 Проверил аппарат — тонер действительно на исходе ({level}%). Это на нашей "
-            "стороне, передаю сотрудникам, чтобы заменили. Пока можно распечатать на другом "
-            "аппарате. Если распечатка испорчена и вы за неё платили — нажмите «😕 Не помогло»."
-        ), True
+            "🌫 Проверил аппарат — картридж действительно на исходе. Это на нашей стороне, "
+            "передаю сотрудникам, чтобы заменили. Пока можно распечатать на другом нашем "
+            "аппарате. Если распечатка испорчена и вы за неё платили — нажмите "
+            "«😕 Не помогло», разберёмся с возвратом."
+        ), (
+            f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}», картридж на "
+            f"исходе ({level}%) — нужно заменить."
+        )
     if level is not None:
         return (
-            f"🌫 Проверил аппарат — тонера достаточно ({level}%), так что дело, скорее всего, "
-            "в чём-то другом. Если распечатка испорчена и вы за неё платили — нажмите "
-            "«😕 Не помогло», передам сотруднику и разберёмся с возвратом."
-        ), False
+            "🌫 Проверил аппарат — с картриджем всё в порядке, тонера достаточно. Попробуйте, "
+            "пожалуйста, распечатать ещё раз — или на другом нашем аппарате, если он рядом. "
+            "Замечание я принял: сотрудники проверят этот аппарат. Если распечатка испорчена "
+            "и вы за неё платили — нажмите «😕 Не помогло», разберёмся с возвратом."
+        ), (
+            f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}». Картридж по "
+            f"мониторингу в норме ({level}%) — стоит посмотреть аппарат вживую."
+        )
     return (
-        "🌫 Сейчас не могу проверить состояние аппарата. Если распечатка испорчена и вы за "
-        "неё платили — нажмите «😕 Не помогло», передам сотруднику."
-    ), False
+        "🌫 Замечание принял — сотрудники проверят этот аппарат. Попробуйте, пожалуйста, "
+        "распечатать ещё раз или воспользоваться другим нашим аппаратом. Если распечатка "
+        "испорчена и вы за неё платили — нажмите «😕 Не помогло», разберёмся с возвратом."
+    ), (
+        f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}». Показаний "
+        "картриджа сейчас нет — нужно посмотреть аппарат вживую."
+    )
 
 
 @router.callback_query(F.data.startswith("quality:"), TicketFlow.intake_qa)
@@ -968,9 +1009,16 @@ async def on_quality_chosen(
         return
 
     label = dict(_QUALITY_ISSUE_OPTIONS)[key]
-    tell_staff = False
+    staff_summary = None
     if key == "faded":
-        reply, tell_staff = await _faded_print_reply(api, apparat_name_text)
+        await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
+        reply, staff_summary = await _faded_print_reply(api, apparat_name_text)
+    elif key == "streaks":
+        reply = _QUALITY_REPLIES[key]
+        staff_summary = (
+            f"▬ Юзер жалуется на полосы/пятна на распечатке на «{apparat_name_text}» — "
+            "аппарату нужно обслуживание."
+        )
     else:
         reply = _QUALITY_REPLIES[key]
 
@@ -978,15 +1026,10 @@ async def on_quality_chosen(
         state, callback.message, telegram_id, username, "print_quality", apparat_name_text,
         label, reply,
     )
-    if tell_staff:
+    if staff_summary:
         await _escalate(
             bot, ticket_id, None,
-            Decision(
-                action="escalate",
-                reason="low_toner_reported",
-                staff_summary=f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}», "
-                "тонер по данным мониторинга на исходе — нужно заменить картридж.",
-            ),
+            Decision(action="escalate", reason="print_quality_reported", staff_summary=staff_summary),
         )
     sessions.touch(telegram_id)
     await callback.answer()
@@ -1694,15 +1737,52 @@ async def on_feedback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
     await callback.answer()
 
 
-@router.message(TicketFlow.awaiting_nothelped_detail)
-async def on_nothelped_detail_provided(
-    message: Message, state: FSMContext, bot: Bot
+@router.message(TicketFlow.awaiting_nothelped_detail, F.photo | F.document)
+async def on_nothelped_detail_receipt(
+    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
 ) -> None:
-    if not message.text:
-        await message.answer("Пожалуйста, напишите текстом, что именно не так.")
-        sessions.touch(str(message.from_user.id))
+    """"Не помогло" answered with a receipt instead of words. Telling someone
+    who just sent proof of payment to "напишите текстом" reads as not having
+    looked at it - take the file, and let the same follow-up logic decide."""
+    file_id, is_document, parsed = await _extract_receipt_data(bot, message)
+    if not file_id:
+        await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
         return
 
+    data = await state.get_data()
+    ticket_id = data["ticket_id"]
+    if parsed is not None and _is_too_old(parsed.paid_at):
+        await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
+        return
+
+    await state.update_data(
+        pending_escalation_receipt_file_id=file_id,
+        pending_escalation_receipt_is_document=is_document,
+    )
+    if parsed is not None:
+        followup_text = (
+            f"Юзер прислал чек оплаты на {parsed.amount} ₸ от {parsed.paid_at:%d.%m %H:%M} "
+            "в подтверждение своей проблемы, без комментария."
+        )
+    else:
+        followup_text = "Юзер прислал чек оплаты в подтверждение своей проблемы, без комментария."
+    await _handle_nothelped_followup(message, state, bot, api, followup_text)
+
+
+@router.message(TicketFlow.awaiting_nothelped_detail)
+async def on_nothelped_detail_provided(
+    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+) -> None:
+    if not message.text:
+        await message.answer("Опишите, пожалуйста, словами, что именно не так — так я пойму быстрее.")
+        sessions.touch(str(message.from_user.id))
+        return
+    await _handle_nothelped_followup(message, state, bot, api, _clip_free_text(message.text))
+
+
+async def _handle_nothelped_followup(
+    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient, followup_text: str
+) -> None:
     data = await state.get_data()
     ticket_id = data["ticket_id"]
     original_reply = data.get("pending_feedback_original_reply", "")
@@ -1718,7 +1798,10 @@ async def on_nothelped_detail_provided(
         original_reply=original_reply,
         problem_type=ticket_record.problem_type if ticket_record else "other",
         raw_text=ticket_record.raw_text if ticket_record else "",
-        user_followup=_clip_free_text(message.text),
+        user_followup=followup_text,
+        apparat_state=await _apparat_state_note(api, ticket_record),
+        already_with_staff=ticket_record is not None
+        and ticket_record.status in _WITH_STAFF_STATUSES,
     )
 
     if followup.action == "resolve":
