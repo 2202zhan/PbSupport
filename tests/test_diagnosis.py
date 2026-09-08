@@ -687,3 +687,45 @@ def test_signal_bounds_refuses_a_window_that_closes_before_the_order():
     assert bounds is not None
     lower, upper = bounds
     assert upper > burst[1].date
+
+
+class _ApparatDirectory:
+    def __init__(self, apparats):
+        self._apparats = apparats
+
+    async def get_apparats(self):
+        return self._apparats
+
+
+def _named(id, name, address):
+    return Apparat(id=id, name_apparat=name, address=address, status="online")
+
+
+async def test_apparat_is_found_by_the_place_the_user_named():
+    # Students name the building, not the machine - "главный корпус" has to
+    # land on the kiosk that stands there.
+    api = _ApparatDirectory([
+        _named(1, "Аппарат №1", "Главный корпус, 1 этаж, Чилл зона"),
+        _named(2, "Аппарат №2", "Второй корпус"),
+    ])
+    found = await diagnosis.find_apparat_by_name(api, "главный корпус")
+    assert found is not None and found.id == 1
+
+
+async def test_an_ambiguous_place_is_not_guessed():
+    # "корпус" is in every address - attaching the ticket to one of them at
+    # random would send staff to the wrong building.
+    api = _ApparatDirectory([
+        _named(1, "Аппарат №1", "Главный корпус"),
+        _named(2, "Аппарат №2", "Второй корпус"),
+    ])
+    assert await diagnosis.find_apparat_by_name(api, "корпус") is None
+
+
+async def test_the_machine_name_still_wins_over_an_address():
+    api = _ApparatDirectory([
+        _named(1, "Аппарат №1", "Второй корпус"),
+        _named(2, "Аппарат №2", "Главный корпус"),
+    ])
+    found = await diagnosis.find_apparat_by_name(api, "Аппарат №2")
+    assert found is not None and found.id == 2

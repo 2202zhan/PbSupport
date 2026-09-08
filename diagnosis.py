@@ -209,10 +209,21 @@ async def _pick_unprinted_candidate(api: PrintBoxAPIClient, candidates: list[Tra
 
 
 async def find_apparat_by_name(api: PrintBoxAPIClient, machine_name: str) -> Apparat | None:
+    """Resolves whatever the user typed into an apparat.
+
+    People name the place, not the machine - "главный корпус", "чилл зона" -
+    so fall back to the address when the name doesn't match. The address is
+    only trusted when exactly one machine matches: "корпус" alone is in three
+    of them, and picking one at random would attach the ticket to the wrong
+    kiosk.
+    """
     apparats = await api.get_apparats()
     for a in apparats:
         if _machine_matches(a.name_apparat, machine_name):
             return a
+    by_address = [a for a in apparats if a.address and _machine_matches(a.address, machine_name)]
+    if len(by_address) == 1:
+        return by_address[0]
     return None
 
 
