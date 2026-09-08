@@ -1,56 +1,22 @@
 """What the agent can do.
 
-Two kinds. A data tool answers the model and the loop continues. A terminal
-tool ends the turn: it returns a TurnResult and nothing further is asked of the
-model. Phase 2 has only the two terminal ones - talking to the user, and
-handing the case to a human. The data tools arrive in phase 4.
+The reading tools are where the "no internal terms" rule is enforced
+structurally rather than by asking the model nicely: they return facts in plain
+Russian, and the figures behind them go into ctx.staff_notes, which the model
+never sees and the escalation card does.
 """
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
 from agent import guards
+from agent.reading import CHECK_APPARAT, FIND_MY_ORDERS, SERVICE_INFO
+from agent.registry import ToolError, ToolRegistry, ToolSpec
 from agent.types import TurnContext, TurnResult
 
-
-@dataclass(frozen=True)
-class ToolSpec:
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    terminal: bool
-    run: Callable[[dict[str, Any], TurnContext], Awaitable[Any]]
-
-    @property
-    def schema(self) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
-
-
-class ToolError(Exception):
-    """The model called a tool wrongly. Reported back to it as a tool result so
-    it can correct itself inside the turn's budget, rather than failing the
-    whole turn over a missing argument."""
-
-
-class ToolRegistry:
-    def __init__(self, specs: list[ToolSpec]) -> None:
-        self._specs = {s.name: s for s in specs}
-
-    @property
-    def schemas(self) -> list[dict[str, Any]]:
-        return [s.schema for s in self._specs.values()]
-
-    def get(self, name: str) -> ToolSpec | None:
-        return self._specs.get(name)
-
+__all__ = [
+    "DEFAULT_TOOLS", "ToolError", "ToolRegistry", "ToolSpec",
+    "REPLY", "ESCALATE", "sanitize_buttons", "MAX_BUTTONS", "EXPECTATIONS",
+]
 
 MAX_BUTTONS = 4
 MAX_BUTTON_LABEL = 40
@@ -180,4 +146,4 @@ ESCALATE = ToolSpec(
     run=_escalate,
 )
 
-DEFAULT_TOOLS = ToolRegistry([REPLY, ESCALATE])
+DEFAULT_TOOLS = ToolRegistry([SERVICE_INFO, CHECK_APPARAT, FIND_MY_ORDERS, REPLY, ESCALATE])

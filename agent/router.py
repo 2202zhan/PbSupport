@@ -20,6 +20,7 @@ from agent import memory, ui
 from agent.gate import agent_enabled_for
 from agent.runtime import run_turn
 from agent.types import TurnContext, TurnResult
+from api_client import PrintBoxAPIClient
 from config import settings
 from guard_rules import Decision
 
@@ -61,22 +62,22 @@ async def on_start(message: Message) -> None:
 
 
 @router.message(F.text)
-async def on_text(message: Message, bot: Bot) -> None:
-    await _handle(bot, message, message.text)
+async def on_text(message: Message, bot: Bot, api: PrintBoxAPIClient) -> None:
+    await _handle(bot, api, message, message.text)
 
 
 @router.message(F.photo | F.document)
-async def on_file(message: Message, bot: Bot) -> None:
+async def on_file(message: Message, bot: Bot, api: PrintBoxAPIClient) -> None:
     """Files are read properly in phase 6. Until then they are at least
     acknowledged here rather than falling through to the menu bot's handlers,
     which would answer an agent conversation with a state machine's question."""
     kind = "фото" if message.photo else "документ"
     caption = f" с подписью: {message.caption}" if message.caption else ""
-    await _handle(bot, message, f"[юзер прислал {kind}{caption}; прочитать его я пока не умею]")
+    await _handle(bot, api, message, f"[юзер прислал {kind}{caption}; прочитать его я пока не умею]")
 
 
 @router.callback_query(F.data.startswith(ui.CALLBACK_PREFIX))
-async def on_button(callback: CallbackQuery, bot: Bot) -> None:
+async def on_button(callback: CallbackQuery, bot: Bot, api: PrintBoxAPIClient) -> None:
     telegram_id = str(callback.from_user.id)
     conversation = await memory.current_conversation(telegram_id, callback.from_user.username)
     label = await ui.resolve(callback.data, conversation.id)
@@ -92,10 +93,12 @@ async def on_button(callback: CallbackQuery, bot: Bot) -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         logger.debug("could not clear the keyboard", exc_info=True)
-    await _handle(bot, callback.message, label, from_user=callback.from_user)
+    await _handle(bot, api, callback.message, label, from_user=callback.from_user)
 
 
-async def _handle(bot: Bot, message: Message, text: str, from_user=None) -> None:
+async def _handle(
+    bot: Bot, api: PrintBoxAPIClient, message: Message, text: str, from_user=None
+) -> None:
     user = from_user or message.from_user
     telegram_id = str(user.id)
     # People send "не печатает" and "аппарат 3" a second apart; without this
@@ -103,19 +106,24 @@ async def _handle(bot: Bot, message: Message, text: str, from_user=None) -> None
     async with memory.one_turn_at_a_time(telegram_id):
         conversation = await memory.current_conversation(telegram_id, user.username)
         await memory.remember_user_message(conversation.id, text)
-        result = await run_turn(
-            TurnContext(
-                telegram_id=telegram_id,
-                username=user.username,
-                conversation_id=conversation.id,
-                user_message=text,
-            )
+        ctx = TurnContext(
+            telegram_id=telegram_id,
+            username=user.username,
+            conversation_id=conversation.id,
+            user_message=text,
+            api=api,
         )
-        await deliver(bot, message, conversation.id, result, user=user)
+        result = await run_turn(ctx)
+        await deliver(bot, message, conversation.id, result, user=user, staff_notes=ctx.staff_notes)
 
 
 async def deliver(
-    bot: Bot, message: Message, conversation_id: int, result: TurnResult, user=None
+    bot: Bot,
+    message: Message,
+    conversation_id: int,
+    result: TurnResult,
+    user=None,
+    staff_notes: list[str] | None = None,
 ) -> None:
     """Carries out what the turn decided. Whatever else happens, the user is
     answered - a turn that reached a human still has to say so."""
@@ -142,7 +150,12 @@ async def deliver(
             Decision(
                 action="escalate",
                 reason=result.reason or "escalated_by_agent",
-                staff_summary=result.staff_summary,
+                # Everything the tools read on this turn, which the model was
+                # never shown - exact readings are useful to a person and only
+                # dangerous in a reply.
+                staff_summary="\n".join(
+                    [result.staff_summary or "", *(staff_notes or [])]
+                ).strip(),
             ),
         )
     except Exception:

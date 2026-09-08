@@ -5,6 +5,7 @@ importing the loop that will do it.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -15,6 +16,12 @@ class TurnContext:
     username: str | None
     conversation_id: int
     user_message: str
+    api: Any = None
+    # Where the reading tools put the figures. The model never sees this - it
+    # goes on the escalation card, where a person can use it. That is what keeps
+    # toner percentages and sheet counts out of the user's reply structurally,
+    # instead of by asking the model not to mention them.
+    staff_notes: list[str] = field(default_factory=list)
 
 
 @dataclass

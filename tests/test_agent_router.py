@@ -160,7 +160,7 @@ async def test_a_tap_is_read_as_the_words_on_the_button(db, monkeypatch):
     seen = _turn(monkeypatch, TurnResult(kind="reply", text="Понял."))
 
     callback = _Callback(markup.inline_keyboard[0][0].callback_data)
-    await agent_router.on_button(callback, None)
+    await agent_router.on_button(callback, None, None)
 
     assert seen["text"] == "только что"
     assert callback.message.markup_cleared  # can't be tapped twice
@@ -178,7 +178,7 @@ async def test_a_tap_is_attributed_to_the_person_not_the_bot(db, monkeypatch):
     escalated = []
     monkeypatch.setattr(agent_router.notify, "send_plain_escalation", _record(escalated))
 
-    await agent_router.on_button(_Callback(markup.inline_keyboard[0][0].callback_data), None)
+    await agent_router.on_button(_Callback(markup.inline_keyboard[0][0].callback_data), None, None)
 
     ticket = await storage.get_ticket(escalated[0][0])
     assert ticket.telegram_id == "884013433"
@@ -187,7 +187,7 @@ async def test_a_tap_is_attributed_to_the_person_not_the_bot(db, monkeypatch):
 async def test_a_stale_button_says_so_instead_of_answering(db, monkeypatch):
     _turn(monkeypatch, TurnResult(kind="reply", text="не должно дойти"))
     callback = _Callback("ab:999999")
-    await agent_router.on_button(callback, None)
+    await agent_router.on_button(callback, None, None)
     assert callback.message.answered and "прошлого разговора" in callback.message.answered[0]
 
 
@@ -232,5 +232,5 @@ async def test_a_file_reaches_the_agent_and_not_the_menu_bot(db, monkeypatch):
     message.photo = [object()]
     message.document = None
     message.caption = "вот чек"
-    await agent_router.on_file(message, None)
+    await agent_router.on_file(message, None, None)
     assert "фото" in seen["text"] and "вот чек" in seen["text"]

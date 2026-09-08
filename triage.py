@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 import advice
+import apparats
 import ai_decider
 import concierge
 import csat
@@ -652,99 +653,10 @@ async def _send_scripted_reply(
     return ticket_id
 
 
-async def _suggest_alternate_apparat(api: PrintBoxAPIClient, apparat_name_text: str) -> str | None:
-    """Looks for another currently-online apparat with no active error, to
-    mention as a stopgap while this one's paper/toner gets refilled. This is a
-    nice-to-have on top of the actual report - an API hiccup here must not
-    leave the user without any confirmation at all."""
-    try:
-        reported = await diagnosis.find_apparat_by_name(api, apparat_name_text)
-        apparats = await api.get_apparats()
-        statuses = {s.get("apparat_id"): s for s in await api.get_all_printer_statuses()}
-    except PrintBoxAPIError:
-        logger.warning("could not look up an alternate apparat for %s", apparat_name_text)
-        return None
-    for a in apparats:
-        if reported is not None and a.id == reported.id:
-            continue
-        status = statuses.get(a.id)
-        if status and status.get("is_online") and not status.get("error_text"):
-            return f"{a.name_apparat} ({a.address})" if a.address else a.name_apparat
-    return None
-
-
-_LOW_PAGES = 50
-_LOW_TONER = 20
-
-# The kiosks are powered on 08:00-19:00 Asia/Almaty. Outside that they're off,
-# so a status read says nothing about the machine - only that it's night.
-_WORKDAY_START_HOUR = 8
-_WORKDAY_END_HOUR = 19
-
-
-def _apparats_are_awake() -> bool:
-    return _WORKDAY_START_HOUR <= tz.now().hour < _WORKDAY_END_HOUR
-
-
 _ASLEEP_REPLY = (
     "🌙 Сейчас аппараты выключены — они работают с 8:00 до 19:00, и состояние аппарата "
     "мне сейчас не видно. Напишите, пожалуйста, в рабочее время: я сразу проверю и отвечу."
 )
-
-
-async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
-    """Looks up what the machine reports about paper and toner, so a "закончилась
-    бумага" report doesn't reach staff as bare hearsay.
-
-    Returns (verdict, staff_note):
-    - "asleep"   - outside 08:00-19:00 the kiosks are off, so there is nothing
-                   to read and nothing to tell staff either;
-    - "critical" - something is genuinely low, or the apparat reports an error;
-    - "healthy"  - it says everything is in order;
-    - "unknown"  - we asked and couldn't get an answer during working hours,
-                   which is itself worth a human look.
-
-    Exact figures go to staff only; the user gets a plain answer, not a dump of
-    our counters.
-    """
-    if not _apparats_are_awake():
-        return "asleep", f"аппараты выключены (сейчас {tz.now():%H:%M}), показаний нет"
-    try:
-        apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
-        statuses = await api.get_all_printer_statuses()
-    except PrintBoxAPIError:
-        logger.warning("could not read supplies for %s", apparat_name_text)
-        return "unknown", "показания аппарата сейчас недоступны"
-    if apparat is None:
-        return "unknown", "аппарат не найден в справочнике"
-
-    current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None) or {}
-    toner = {k: v for k, v in (current.get("toner") or {}).items() if isinstance(v, (int, float))}
-    lowest_toner = min(toner.values()) if toner else None
-    pages = apparat.pages_left
-    error_text = current.get("error_text")
-
-    findings = []
-    if pages is not None:
-        findings.append(f"{pages} {_sheets_word(pages)} бумаги")
-    if lowest_toner is not None:
-        findings.append(f"тонер {lowest_toner}%")
-    if error_text:
-        findings.append(f"аппарат сообщает: {error_text}")
-    if not findings:
-        return "unknown", "показаний от аппарата нет"
-
-    staff_note = ", ".join(findings)
-    confirmed = bool(error_text) or (pages is not None and pages < _LOW_PAGES) or (
-        lowest_toner is not None and lowest_toner < _LOW_TONER
-    )
-    return ("critical" if confirmed else "healthy"), staff_note
-
-
-def _sheets_word(n: int) -> str:
-    if 11 <= n % 100 <= 14:
-        return "листов"
-    return {1: "лист", 2: "листа", 3: "листа", 4: "листа"}.get(n % 10, "листов")
 
 
 async def _report_device_issue(
@@ -755,7 +667,7 @@ async def _report_device_issue(
     staff the readings instead of a bare "юзер сообщает"."""
     telegram_id = str(callback.from_user.id)
     username = callback.from_user.username
-    if not _apparats_are_awake():
+    if not apparats.are_awake():
         # Nothing to read and nothing to report: a reading taken while the
         # kiosks are off says only that it is night.
         await callback.message.edit_text(_ASLEEP_REPLY, reply_markup=_main_menu_keyboard())
@@ -764,7 +676,7 @@ async def _report_device_issue(
         return
 
     await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
-    verdict, staff_note = await _read_supplies(api, apparat_name_text)
+    verdict, staff_note = await apparats.read_supplies(api, apparat_name_text)
 
     if verdict == "healthy":
         # The apparat reports its own faults through error_text, so a clean
@@ -805,7 +717,7 @@ async def _report_device_issue(
         checked = " Проверил — аппарат действительно сообщает о нехватке расходников."
     else:
         checked = ""
-    alternate = await _suggest_alternate_apparat(api, apparat_name_text)
+    alternate = await apparats.suggest_alternate(api, apparat_name_text)
     note = f" Пока можно воспользоваться аппаратом «{alternate}», если рядом." if alternate else ""
     await callback.message.edit_text(
         f"Спасибо!{checked} Передал сотруднику — на аппарате «{apparat_name_text}» "
@@ -937,7 +849,7 @@ async def _apparat_state_note(
         return None
     if ticket.problem_type not in ("print_quality", "device_issue"):
         return None
-    verdict, _ = await _read_supplies(api, ticket.apparat_name)
+    verdict, _ = await apparats.read_supplies(api, ticket.apparat_name)
     return {
         "asleep": "аппараты сейчас выключены (работают с 8:00 до 19:00), свежих показаний нет",
         "critical": "на этом аппарате заканчиваются бумага или тонер — заменить их наша задача",
@@ -1018,7 +930,7 @@ async def on_quality_chosen(
     label = dict(_QUALITY_ISSUE_OPTIONS)[key]
     staff_summary = None
     if key in _QUALITY_CHECKED_ISSUES:
-        if not _apparats_are_awake():
+        if not apparats.are_awake():
             # Don't promise a check we can't run: the kiosks are off, and a
             # reading taken now would only say that it is night.
             await callback.message.edit_text(_ASLEEP_REPLY, reply_markup=_main_menu_keyboard())
@@ -1027,7 +939,7 @@ async def on_quality_chosen(
             await callback.answer()
             return
         await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
-        verdict, staff_note = await _read_supplies(api, apparat_name_text)
+        verdict, staff_note = await apparats.read_supplies(api, apparat_name_text)
         reply, staff_summary = _quality_reply(key, verdict, apparat_name_text, staff_note)
     else:
         reply = _QUALITY_REPLIES[key]

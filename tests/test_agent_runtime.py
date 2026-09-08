@@ -237,10 +237,16 @@ async def test_every_turn_leaves_a_row_to_look_at_later(db, monkeypatch):
     assert json.loads(row["tool_calls"]) == ["reply"]
 
 
-def test_the_shipped_tools_are_the_two_terminal_ones():
-    assert {s["function"]["name"] for s in DEFAULT_TOOLS.schemas} == {"reply", "escalate"}
+def test_only_the_talking_tools_end_the_turn():
+    # Reading tools feed the model and the loop continues; only reply and
+    # escalate finish a turn.
+    assert {s["function"]["name"] for s in DEFAULT_TOOLS.schemas} == {
+        "service_info", "check_apparat", "find_my_orders", "reply", "escalate",
+    }
     assert DEFAULT_TOOLS.get("reply").terminal
     assert DEFAULT_TOOLS.get("escalate").terminal
+    for name in ("service_info", "check_apparat", "find_my_orders"):
+        assert not DEFAULT_TOOLS.get(name).terminal
 
 
 async def test_empty_reply_text_is_rejected_not_sent():
