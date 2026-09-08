@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     draft_reply TEXT,
     forum_topic_id INTEGER,
     payment_expected INTEGER NOT NULL DEFAULT 1,
+    live_chat INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -87,6 +88,8 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE tickets ADD COLUMN payment_expected INTEGER NOT NULL DEFAULT 1"
             )
+        if "live_chat" not in existing:
+            conn.execute("ALTER TABLE tickets ADD COLUMN live_chat INTEGER NOT NULL DEFAULT 0")
 
 
 @dataclass
@@ -106,6 +109,10 @@ class TicketRecord:
     # never appeared, the bank refused, the file never uploaded). Asking those
     # users for a receipt reads as not having listened to them.
     payment_expected: int
+    # While set, staff and the user are talking directly through the bot: every
+    # message either side sends is relayed, with no buttons in between, until
+    # staff close the ticket.
+    live_chat: int
     created_at: str
 
 
@@ -227,6 +234,31 @@ def _find_ticket_awaiting_receipt_sync(telegram_id: str) -> TicketRecord | None:
             (telegram_id,),
         ).fetchone()
         return TicketRecord(**dict(row)) if row else None
+
+
+def _set_live_chat_sync(ticket_id: int, on: bool) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE tickets SET live_chat = ? WHERE id = ?", (int(on), ticket_id))
+
+
+async def set_live_chat(ticket_id: int, on: bool) -> None:
+    await asyncio.to_thread(_set_live_chat_sync, ticket_id, on)
+
+
+def _find_live_chat_ticket_sync(telegram_id: str) -> TicketRecord | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE telegram_id = ? AND live_chat = 1 "
+            "ORDER BY id DESC LIMIT 1",
+            (telegram_id,),
+        ).fetchone()
+        return TicketRecord(**dict(row)) if row else None
+
+
+async def find_live_chat_ticket(telegram_id: str) -> TicketRecord | None:
+    """Anything this user sends goes to the staff thread while this is open,
+    instead of to the assistant."""
+    return await asyncio.to_thread(_find_live_chat_ticket_sync, telegram_id)
 
 
 async def find_ticket_awaiting_receipt(telegram_id: str) -> TicketRecord | None:

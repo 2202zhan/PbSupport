@@ -4,6 +4,7 @@ import re
 from datetime import timedelta
 
 from aiogram import Bot, F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1792,6 +1793,21 @@ async def on_followup_message(message: Message, state: FSMContext, bot: Bot, api
     await state.update_data(dialogue_history=dialogue_history)
     sessions.touch(ticket_input.telegram_id)
     await _run_decision_cycle(bot, api, state, message, ticket_id, ticket_input)
+
+
+@router.message(StateFilter(None))
+async def on_live_chat_message(message: Message, bot: Bot) -> None:
+    """While a staff member has the dialogue open, everything the user writes
+    goes to them - not to the assistant. Registered before the receipt and
+    concierge handlers so a real conversation is never answered by a model."""
+    ticket = await storage.find_live_chat_ticket(str(message.from_user.id))
+    if ticket is None:
+        raise SkipHandler
+    try:
+        await notify.relay_user_message(bot, ticket, message)
+    except Exception:
+        logger.exception("could not relay user message for ticket %s", ticket.id)
+        await message.answer("Не получилось передать сообщение, попробуйте ещё раз.")
 
 
 @router.message(StateFilter(None), F.photo | F.document)

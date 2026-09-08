@@ -83,10 +83,16 @@ def _closing_message(ticket) -> str:
     template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
     return template.format(ticket_id=ticket.id)
 
-# Threads where a staff member tapped "Ответить" and their next message should
-# go to the user. Deliberately in memory: it lives for seconds, and losing it
-# on restart just means the message isn't relayed - nothing breaks.
-_awaiting_staff_reply: set[int] = set()
+_LIVE_CHAT_OPENED_USER = (
+    "💬 С вами на связи сотрудник поддержки. Пишите прямо сюда — он всё видит и ответит."
+)
+
+_LIVE_CHAT_OPENED_STAFF = (
+    "💬 Диалог с юзером открыт. Всё, что вы пишете в этой теме, уходит ему, а его ответы "
+    "приходят сюда. Закончите — закройте заявку кнопкой на карточке выше."
+)
+
+_LIVE_CHAT_CLOSED_USER = "💬 Диалог с сотрудником завершён."
 
 
 def _escalation_keyboard(
@@ -352,8 +358,17 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
             logger.exception("could not tell the user ticket %s was rejected", ticket_id)
         new_text = callback.message.text + f"\n\n❌ Отклонено ({staff_name})"
 
+    # Closing the ticket is what ends the live chat - that's the promise made to
+    # both sides when it opened.
+    if ticket.live_chat:
+        await storage.set_live_chat(ticket_id, False)
+        try:
+            await bot.send_message(int(ticket.telegram_id), _LIVE_CHAT_CLOSED_USER)
+        except Exception:
+            logger.debug("could not tell the user chat %s closed", ticket_id, exc_info=True)
+
     # The refund decision is final, but the conversation isn't: staff keep the
-    # reply button so they can explain a rejection in their own words.
+    # reply button so they can reopen the dialogue if the user comes back.
     await callback.message.edit_text(
         new_text,
         reply_markup=InlineKeyboardMarkup(
@@ -362,7 +377,6 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
             ]
         ),
     )
-    _awaiting_staff_reply.discard(ticket.forum_topic_id)
     await _close_topic(bot, settings.support_staff_chat_id, ticket.forum_topic_id)
     await callback.answer()
 
@@ -415,27 +429,31 @@ async def handle_reply_request(callback: CallbackQuery, bot: Bot) -> None:
     except Exception:
         logger.debug("topic %s was already open", ticket.forum_topic_id, exc_info=True)
 
-    _awaiting_staff_reply.add(ticket.forum_topic_id)
+    await storage.set_live_chat(ticket_id, True)
+    try:
+        await bot.send_message(int(ticket.telegram_id), _LIVE_CHAT_OPENED_USER)
+    except Exception:
+        logger.exception("could not tell the user a staff member joined ticket %s", ticket_id)
     await bot.send_message(
         settings.support_staff_chat_id,
-        "✍️ Напишите следующим сообщением в этой теме — я передам его юзеру дословно.",
+        _LIVE_CHAT_OPENED_STAFF,
         message_thread_id=ticket.forum_topic_id,
     )
-    await callback.answer()
+    await callback.answer("Диалог открыт")
 
 
-@router.message(F.chat.id == settings.support_staff_chat_id, F.message_thread_id, F.text)
+@router.message(F.chat.id == settings.support_staff_chat_id, F.message_thread_id)
 async def relay_staff_reply(message: Message, bot: Bot) -> None:
-    """Only relays after someone tapped "Ответить" in this thread - otherwise
-    staff couldn't discuss a case among themselves without the user seeing it."""
-    thread_id = message.message_thread_id
-    if thread_id not in _awaiting_staff_reply:
+    """Relays while the ticket is in live chat - staff shouldn't have to tap a
+    button per message. Outside live chat this stays quiet, so a shift can
+    still discuss a case in its thread without the user reading along."""
+    ticket = await storage.get_ticket_by_topic(message.message_thread_id)
+    if ticket is None or not ticket.live_chat:
         return
-    ticket = await storage.get_ticket_by_topic(thread_id)
-    if ticket is None:
+    if not message.text:
+        await message.reply("Пока умею пересылать только текст — напишите словами.")
         return
 
-    _awaiting_staff_reply.discard(thread_id)
     try:
         await bot.send_message(
             int(ticket.telegram_id), f"💬 Сотрудник поддержки:\n\n{message.text}"
@@ -443,5 +461,26 @@ async def relay_staff_reply(message: Message, bot: Bot) -> None:
     except Exception:
         logger.exception("could not relay staff reply for ticket %s", ticket.id)
         await message.reply("Не удалось доставить — юзер мог заблокировать бота.")
-        return
-    await message.reply("Отправил юзеру ✅")
+
+
+async def relay_user_message(bot: Bot, ticket, message: Message) -> None:
+    """The other half of live chat: whatever the user sends goes into the
+    ticket's own thread, so the conversation stays in one place."""
+    thread_id = ticket.forum_topic_id
+    caption = f"👤 Юзер (#{ticket.id})"
+    if message.photo:
+        await bot.send_photo(
+            settings.support_staff_chat_id, message.photo[-1].file_id,
+            caption=f"{caption}: {message.caption or 'фото'}", message_thread_id=thread_id,
+        )
+    elif message.document:
+        await bot.send_document(
+            settings.support_staff_chat_id, message.document.file_id,
+            caption=f"{caption}: {message.caption or 'файл'}", message_thread_id=thread_id,
+        )
+    else:
+        await bot.send_message(
+            settings.support_staff_chat_id,
+            f"{caption}:\n\n{message.text or '(без текста)'}",
+            message_thread_id=thread_id,
+        )

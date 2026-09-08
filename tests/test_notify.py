@@ -28,7 +28,7 @@ def _fake_ticket(
         id=1, telegram_id="123", username="user", contact=None,
         problem_type="not_printed", apparat_name="Аппарат №1", raw_text="не печатает",
         transaction_id=transaction_id, status=status, draft_reply=draft_reply,
-        forum_topic_id=forum_topic_id, payment_expected=1, created_at="2026-06-29T12:00:00",
+        forum_topic_id=forum_topic_id, payment_expected=1, live_chat=0, created_at="2026-06-29T12:00:00",
     )
 
 
@@ -197,24 +197,66 @@ async def test_ask_receipt_does_not_mark_the_ticket_if_the_user_is_unreachable()
     assert callback.answer.call_args.kwargs.get("show_alert") is True
 
 
-async def test_staff_reply_is_relayed_only_after_the_button():
+def _live_ticket(**overrides):
+    ticket = _fake_ticket(**overrides)
+    ticket.live_chat = 1
+    return ticket
+
+
+async def test_staff_chatter_outside_live_chat_stays_internal():
+    # A shift discussing a case in its own thread must not be broadcast to the
+    # person the case is about.
     message = AsyncMock()
     message.message_thread_id = 42
-    message.text = "Проверили вручную, деньги вернём завтра."
+    message.text = "он вчера уже писал, помнишь?"
     bot = AsyncMock()
 
-    notify._awaiting_staff_reply.discard(42)
-    with patch.object(storage, "get_ticket_by_topic", AsyncMock(return_value=_fake_ticket())) as lookup:
-        await notify.relay_staff_reply(message, bot)
-    lookup.assert_not_called()  # nobody tapped "Ответить" - this was staff chatter
-
-    notify._awaiting_staff_reply.add(42)
     with patch.object(storage, "get_ticket_by_topic", AsyncMock(return_value=_fake_ticket())):
         await notify.relay_staff_reply(message, bot)
-    bot.send_message.assert_called_once()
-    assert message.text in bot.send_message.call_args.args[1]
-    # One tap, one relayed message - the next line of discussion stays internal.
-    assert 42 not in notify._awaiting_staff_reply
+
+    bot.send_message.assert_not_called()
+
+
+async def test_every_staff_message_is_relayed_while_live_chat_is_open():
+    # The point of live chat: no button between each message.
+    bot = AsyncMock()
+    for text in ["Здравствуйте, разбираюсь.", "Проверил — вернём сегодня."]:
+        message = AsyncMock()
+        message.message_thread_id = 42
+        message.text = text
+        with patch.object(storage, "get_ticket_by_topic", AsyncMock(return_value=_live_ticket())):
+            await notify.relay_staff_reply(message, bot)
+
+    assert bot.send_message.call_count == 2
+    assert "вернём сегодня" in bot.send_message.call_args.args[1]
+
+
+async def test_opening_live_chat_tells_both_sides():
+    callback = _fake_callback(f"{notify._REPLY_PREFIX}1")
+    bot = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket(forum_topic_id=42))), \
+         patch.object(storage, "set_live_chat", AsyncMock()) as live_mock:
+        await notify.handle_reply_request(callback, bot)
+
+    live_mock.assert_called_once_with(1, True)
+    recipients = [c.args[0] for c in bot.send_message.call_args_list]
+    assert 123 in recipients  # the user learns a human joined
+    assert notify.settings.support_staff_chat_id in recipients
+
+
+async def test_closing_the_ticket_ends_the_live_chat():
+    callback = _fake_callback(f"{notify._REJECT_PREFIX}1")
+    bot = AsyncMock()
+    api = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_live_ticket())), \
+         patch.object(storage, "resolve_escalation", AsyncMock()), \
+         patch.object(storage, "set_ticket_status", AsyncMock()), \
+         patch.object(storage, "set_live_chat", AsyncMock()) as live_mock:
+        await notify.handle_escalation_decision(callback, bot, api)
+
+    live_mock.assert_called_once_with(1, False)
 
 
 def _plain_ticket(**overrides) -> storage.TicketRecord:
@@ -222,7 +264,7 @@ def _plain_ticket(**overrides) -> storage.TicketRecord:
         id=12, telegram_id="943402384", username="Niidaime", contact="+77001234567",
         problem_type="payment_error", apparat_name="Аппарат №1",
         raw_text="QR-код не появился на экране", transaction_id=None, status="open",
-        draft_reply=None, forum_topic_id=None, payment_expected=1, created_at="2026-06-20T12:00:00",
+        draft_reply=None, forum_topic_id=None, payment_expected=1, live_chat=0, created_at="2026-06-20T12:00:00",
     )
     defaults.update(overrides)
     return storage.TicketRecord(**defaults)

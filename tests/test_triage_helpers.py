@@ -374,7 +374,7 @@ def _record(**overrides) -> storage.TicketRecord:
         id=1, telegram_id="123", username="u", contact="+77000000000",
         problem_type="payment_error", apparat_name="Аппарат №1",
         raw_text="QR-код не появился на экране", transaction_id=None, status="escalated",
-        draft_reply=None, forum_topic_id=None, payment_expected=1,
+        draft_reply=None, forum_topic_id=None, payment_expected=1, live_chat=0,
         created_at="2026-09-08T00:00:00",
     )
     defaults.update(overrides)
@@ -470,3 +470,40 @@ async def test_only_the_branch_that_escalates_claims_it_did():
         assert claims == should_notify, reply
     for key, reply in triage._QUALITY_REPLIES.items():
         assert "передал сотрудник" not in reply.lower(), key
+
+
+async def test_user_message_goes_to_staff_while_live_chat_is_open(monkeypatch):
+    # Without this the user answers a human and the assistant replies instead -
+    # which is what happened when the relay was one message wide.
+    relayed = []
+
+    async def _relay(bot, ticket, message):
+        relayed.append(message.text)
+
+    async def _find(_tid):
+        return _record(live_chat=1, forum_topic_id=42)
+
+    monkeypatch.setattr(triage.notify, "relay_user_message", _relay)
+    monkeypatch.setattr(triage.storage, "find_live_chat_ticket", _find)
+
+    message = _RecordingMessage("а когда почините?")
+    await triage.on_live_chat_message(message, bot=None)
+
+    assert relayed == ["а когда почините?"]
+
+
+async def test_without_live_chat_the_message_falls_through_to_the_assistant(monkeypatch):
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    async def _find(_tid):
+        return None
+
+    monkeypatch.setattr(triage.storage, "find_live_chat_ticket", _find)
+
+    message = _RecordingMessage("сколько стоит цветная печать?")
+    try:
+        await triage.on_live_chat_message(message, bot=None)
+    except SkipHandler:
+        pass
+    else:
+        raise AssertionError("should have skipped to the next handler")
