@@ -248,11 +248,11 @@ async def test_neighbors_with_unavailable_snmp_not_counted_as_failures(monkeypat
     assert evidence.mass_outage_suspected is False
 
 
-async def test_snmp_confirmed_skips_log_check_entirely(monkeypatch):
-    # SNMP is the primary signal - once it confirms printing actually happened,
-    # that's the end of it, logs are a redundant cost and shouldn't be consulted.
-    # (A confident "no" from SNMP is different - see the "clean single failure"
-    # test above, where logs are still checked to learn *why*.)
+async def test_logs_are_read_even_when_snmp_confirms_the_print(monkeypatch):
+    # SNMP only knows the printer entered a Printing state, not whose file it
+    # was; the logs are anchored on this document's own name. Ticket #51 was
+    # that gap - a confirmed signal, a user holding nothing, and no log
+    # evidence gathered to tell which was right.
     monkeypatch.setattr(diagnosis.asyncio, "sleep", _no_sleep)
     api = FakeAPI()
     base = datetime(2026, 6, 18, 12, 0, 0)
@@ -261,15 +261,15 @@ async def test_snmp_confirmed_skips_log_check_entirely(monkeypatch):
         PrinterStatusEvent(is_online=True, status="Printing", error_text=None,
                             created_at=base + timedelta(seconds=10))
     )
-    # Logs would say there was a download error - irrelevant, should be ignored.
     api.device_logs[APPARAT_ID] = ERROR_LOG.format(ts=_fmt(base), ts2=_fmt(base + timedelta(seconds=20)))
 
     evidence = await gather_evidence(api, _ticket(manual_hint_time=base))
 
     assert evidence.print_signal_confirmed is True
-    assert evidence.log_print_success is None
-    assert evidence.log_download_error is None
-    assert api.request_device_logs_calls == 0
+    # The contradiction is preserved rather than hidden - weighing it is the
+    # decision layer's job (see ai_decider's rule 3).
+    assert evidence.log_download_error is True
+    assert evidence.log_print_success is False
 
 
 async def test_log_check_uses_filename_hint_to_disambiguate_busy_apparat(monkeypatch):

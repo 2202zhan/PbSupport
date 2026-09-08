@@ -485,14 +485,16 @@ async def gather_evidence(api: PrintBoxAPIClient, ticket: TicketInput) -> Eviden
         else:
             lower, upper = bounds
             evidence.print_signal_confirmed = await _check_print_signal(api, apparat.id, lower, upper)
-        if evidence.print_signal_confirmed is not True:
-            # SNMP didn't confirm printing (confident "no", or no data at all) -
-            # check logs too: that's the only way to learn *why* (download error
-            # vs something else), and it doubles as a cross-check against SNMP.
-            filename_hint = await _find_document_filename(api, ticket.telegram_id, transaction.date)
-            evidence.log_download_error, evidence.log_print_success = await _check_device_logs(
-                api, apparat.id, lower, upper, filename_hint=filename_hint
-            )
+        # Always read the logs, including when SNMP already says the job
+        # printed. SNMP only knows the printer entered a Printing state; the
+        # logs are anchored on this document's own filename, so they can say
+        # whether *this* file made it. Ticket #51 was exactly that gap - a
+        # confirmed print signal, a user holding nothing, and no log evidence
+        # gathered to tell which was right.
+        filename_hint = await _find_document_filename(api, ticket.telegram_id, transaction.date)
+        evidence.log_download_error, evidence.log_print_success = await _check_device_logs(
+            api, apparat.id, lower, upper, filename_hint=filename_hint
+        )
 
         # Cheap, real-time check first: PrintBox's own monitoring already
         # classifies device health continuously, so a current multi-apparat
