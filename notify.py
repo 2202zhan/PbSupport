@@ -30,6 +30,7 @@ _CONFIRM_PREFIX = "supportbot:confirm:"
 _REJECT_PREFIX = "supportbot:reject:"
 _ASK_RECEIPT_PREFIX = "supportbot:askreceipt:"
 _REPLY_PREFIX = "supportbot:reply:"
+_REOPEN_PREFIX = "supportbot:reopen:"
 
 _CONFIDENCE_LABELS = {"high": "высокая", "medium": "средняя", "low": "низкая"}
 
@@ -367,13 +368,13 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
         except Exception:
             logger.debug("could not tell the user chat %s closed", ticket_id, exc_info=True)
 
-    # The refund decision is final, but the conversation isn't: staff keep the
-    # reply button so they can reopen the dialogue if the user comes back.
+    # The decision is final, but the case isn't necessarily over: one tap
+    # brings the whole card back - conversation open, close button included.
     await callback.message.edit_text(
         new_text,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✍️ Ответить", callback_data=f"{_REPLY_PREFIX}{ticket_id}")]
+                [InlineKeyboardButton(text="🔄 Переоткрыть", callback_data=f"{_REOPEN_PREFIX}{ticket_id}")]
             ]
         ),
     )
@@ -408,6 +409,27 @@ async def handle_ask_receipt(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer("Запросил чек у юзера")
 
 
+async def _open_live_chat(bot: Bot, ticket) -> None:
+    """Puts a ticket into two-way conversation and tells both sides."""
+    # A resolved ticket's thread is closed, and a closed topic only accepts
+    # messages from admins - reopen it so anyone on shift can type.
+    try:
+        await bot.reopen_forum_topic(settings.support_staff_chat_id, ticket.forum_topic_id)
+    except Exception:
+        logger.debug("topic %s was already open", ticket.forum_topic_id, exc_info=True)
+
+    await storage.set_live_chat(ticket.id, True)
+    try:
+        await bot.send_message(int(ticket.telegram_id), _LIVE_CHAT_OPENED_USER)
+    except Exception:
+        logger.exception("could not tell the user a staff member joined ticket %s", ticket.id)
+    await bot.send_message(
+        settings.support_staff_chat_id,
+        _LIVE_CHAT_OPENED_STAFF,
+        message_thread_id=ticket.forum_topic_id,
+    )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith(_REPLY_PREFIX))
 async def handle_reply_request(callback: CallbackQuery, bot: Bot) -> None:
     ticket_id = int(callback.data.split(":")[-1])
@@ -422,24 +444,33 @@ async def handle_reply_request(callback: CallbackQuery, bot: Bot) -> None:
         )
         return
 
-    # The thread is closed once the case is resolved, and a closed topic only
-    # accepts messages from admins - reopen it so anyone on shift can type.
-    try:
-        await bot.reopen_forum_topic(settings.support_staff_chat_id, ticket.forum_topic_id)
-    except Exception:
-        logger.debug("topic %s was already open", ticket.forum_topic_id, exc_info=True)
-
-    await storage.set_live_chat(ticket_id, True)
-    try:
-        await bot.send_message(int(ticket.telegram_id), _LIVE_CHAT_OPENED_USER)
-    except Exception:
-        logger.exception("could not tell the user a staff member joined ticket %s", ticket_id)
-    await bot.send_message(
-        settings.support_staff_chat_id,
-        _LIVE_CHAT_OPENED_STAFF,
-        message_thread_id=ticket.forum_topic_id,
-    )
+    await _open_live_chat(bot, ticket)
     await callback.answer("Диалог открыт")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith(_REOPEN_PREFIX))
+async def handle_reopen(callback: CallbackQuery, bot: Bot) -> None:
+    """Brings a closed case fully back: the same buttons as before, and the
+    conversation open again. Without this, "Ответить" on a resolved ticket
+    started a chat that had no button left to end it."""
+    ticket_id = int(callback.data.split(":")[-1])
+    ticket = await storage.get_ticket(ticket_id)
+    if ticket is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+
+    was_refunded = ticket.status == "resolved_refund"
+    await storage.set_ticket_status(ticket_id, "escalated")
+    await _open_live_chat(bot, ticket)
+
+    # Money already moved on a refunded ticket - reopening is for talking, not
+    # for a second refund.
+    can_refund = bool(ticket.transaction_id) and not was_refunded
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n🔄 Переоткрыто ({callback.from_user.full_name})",
+        reply_markup=_escalation_keyboard(ticket_id, can_refund, bool(ticket.payment_expected)),
+    )
+    await callback.answer("Заявка снова открыта")
 
 
 @router.message(F.chat.id == settings.support_staff_chat_id, F.message_thread_id)

@@ -79,10 +79,10 @@ async def test_first_confirm_refunds_and_removes_buttons():
     set_status_mock.assert_called_once_with(1, "resolved_refund")
     callback.message.edit_text.assert_called_once()
     _, kwargs = callback.message.edit_text.call_args
-    # Refund/reject are gone so nobody taps them twice, but staff keep a way to
-    # write to the user afterwards.
+    # Refund/reject are gone so nobody taps them twice, but the case can be
+    # brought back in full with one tap.
     callbacks = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
-    assert callbacks == [f"{notify._REPLY_PREFIX}1"]
+    assert callbacks == [f"{notify._REOPEN_PREFIX}1"]
 
 
 async def test_confirm_sends_the_ai_draft_reply_to_the_user():
@@ -378,3 +378,54 @@ def test_receipt_button_is_hidden_when_no_payment_could_exist():
     callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]
     assert not any(c.startswith(notify._ASK_RECEIPT_PREFIX) for c in callbacks)
     assert any(c.startswith(notify._REPLY_PREFIX) for c in callbacks)
+
+
+async def test_reopening_restores_the_working_card():
+    # "Ответить" on a closed ticket used to start a conversation with no button
+    # left to end it. Reopening has to bring the whole card back.
+    callback = _fake_callback(f"{notify._REOPEN_PREFIX}1")
+    bot = AsyncMock()
+    ticket = _fake_ticket(status="resolved_rejected", forum_topic_id=42)
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=ticket)), \
+         patch.object(storage, "set_ticket_status", AsyncMock()) as status_mock, \
+         patch.object(storage, "set_live_chat", AsyncMock()) as live_mock:
+        await notify.handle_reopen(callback, bot)
+
+    status_mock.assert_called_once_with(1, "escalated")
+    live_mock.assert_called_once_with(1, True)
+    _, kwargs = callback.message.edit_text.call_args
+    callbacks = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert any(c.startswith(notify._REJECT_PREFIX) for c in callbacks)  # can be closed again
+    assert any(c.startswith(notify._CONFIRM_PREFIX) for c in callbacks)
+
+
+async def test_reopening_a_refunded_ticket_offers_no_second_refund():
+    callback = _fake_callback(f"{notify._REOPEN_PREFIX}1")
+    bot = AsyncMock()
+    ticket = _fake_ticket(status="resolved_refund", forum_topic_id=42)
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=ticket)), \
+         patch.object(storage, "set_ticket_status", AsyncMock()), \
+         patch.object(storage, "set_live_chat", AsyncMock()):
+        await notify.handle_reopen(callback, bot)
+
+    _, kwargs = callback.message.edit_text.call_args
+    callbacks = [b.callback_data for row in kwargs["reply_markup"].inline_keyboard for b in row]
+    assert not any(c.startswith(notify._CONFIRM_PREFIX) for c in callbacks)
+    assert any(c.startswith(notify._REJECT_PREFIX) for c in callbacks)
+
+
+async def test_reopening_lets_the_ticket_be_closed_again():
+    # The double-tap guard keys on status, so reopening must clear it or the
+    # close button would answer "эта заявка уже обработана".
+    callback = _fake_callback(f"{notify._REJECT_PREFIX}1")
+    bot = AsyncMock()
+    api = AsyncMock()
+
+    with patch.object(storage, "get_ticket", AsyncMock(return_value=_fake_ticket(status="escalated"))), \
+         patch.object(storage, "resolve_escalation", AsyncMock()), \
+         patch.object(storage, "set_ticket_status", AsyncMock()) as status_mock:
+        await notify.handle_escalation_decision(callback, bot, api)
+
+    status_mock.assert_called_once_with(1, "resolved_rejected")
