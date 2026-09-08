@@ -423,3 +423,50 @@ async def test_paid_complaint_still_asks_for_the_receipt(monkeypatch):
     )
 
     assert any("чек" in t.lower() for t in message.answered_with)
+
+
+class _TonerApi:
+    def __init__(self, toner=None, raise_=False):
+        self.toner, self.raise_ = toner, raise_
+
+    async def get_apparats(self):
+        if self.raise_:
+            from api_client import PrintBoxAPIError
+            raise PrintBoxAPIError("down")
+        return [_FakeApparat(id=1, name_apparat="Аппарат №1")]
+
+    async def get_all_printer_statuses(self):
+        if self.raise_:
+            from api_client import PrintBoxAPIError
+            raise PrintBoxAPIError("down")
+        return [{"apparat_id": 1, "is_online": True, "error_text": None, "toner": self.toner}]
+
+
+async def test_low_toner_is_reported_to_staff():
+    reply, tell_staff = await triage._faded_print_reply(_TonerApi({"black": 4}), "Аппарат №1")
+    assert tell_staff is True
+    assert "4%" in reply
+
+
+async def test_healthy_toner_is_not_reported_to_staff():
+    reply, tell_staff = await triage._faded_print_reply(_TonerApi({"black": 80}), "Аппарат №1")
+    assert tell_staff is False
+    assert "80%" in reply
+
+
+async def test_unreadable_toner_does_not_guess():
+    reply, tell_staff = await triage._faded_print_reply(_TonerApi(raise_=True), "Аппарат №1")
+    assert tell_staff is False
+    assert "не могу проверить" in reply
+
+
+async def test_only_the_branch_that_escalates_claims_it_did():
+    # The recurring bug: a scripted reply saying "передал сотрудникам" when
+    # _send_scripted_reply notifies nobody, leaving the user waiting.
+    for api, should_notify in [(_TonerApi({"black": 4}), True), (_TonerApi({"black": 80}), False),
+                               (_TonerApi(raise_=True), False)]:
+        reply, tell_staff = await triage._faded_print_reply(api, "Аппарат №1")
+        claims = "передаю сотрудник" in reply.lower() or "передал сотрудник" in reply.lower()
+        assert claims == should_notify, reply
+    for key, reply in triage._QUALITY_REPLIES.items():
+        assert "передал сотрудник" not in reply.lower(), key

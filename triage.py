@@ -634,10 +634,13 @@ async def _send_scripted_reply(
     raw_text: str,
     reply_text: str,
     payment_expected: bool = True,
-) -> None:
+) -> int:
     """For sub-options where the cause is already known from the button alone (or
     a quick live check) - no transaction could exist or there's nothing useful to
-    look up, so skip the full diagnosis pipeline and just answer directly."""
+    look up, so skip the full diagnosis pipeline and just answer directly.
+
+    Returns the ticket id, so a caller that also wants to notify staff (see the
+    low-toner branch of on_quality_chosen) can escalate the same ticket."""
     ticket_id = await storage.create_ticket(
         telegram_id=telegram_id,
         username=username,
@@ -651,6 +654,7 @@ async def _send_scripted_reply(
     await message.answer(reply_text, reply_markup=_feedback_keyboard(ticket_id))
     sessions.forget(telegram_id)
     await state.clear()
+    return ticket_id
 
 
 async def _suggest_alternate_apparat(api: PrintBoxAPIClient, apparat_name_text: str) -> str | None:
@@ -816,10 +820,13 @@ async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext, bot
     await callback.answer()
 
 
-async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> str:
+async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, bool]:
     """Answers a "faded print" complaint from the apparat's real toner level.
     The user can't act on toner either way - it's ours to refill - so the reply
-    only ever states what we found and what we're doing about it."""
+    only ever states what we found and what we're doing about it.
+
+    Returns (reply, tell_staff): a confirmed low cartridge is worth waking staff
+    for on its own, the same as a "бумага/тонер закончились" report."""
     level = None
     try:
         apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
@@ -833,25 +840,29 @@ async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> 
         logger.warning("could not read toner for %s", apparat_name_text)
 
     if level is not None and level < 20:
+        # Only this branch actually reaches staff (see on_quality_chosen), so
+        # only this branch is allowed to say so.
         return (
             f"🌫 Проверил аппарат — тонер действительно на исходе ({level}%). Это на нашей "
-            "стороне, передал сотрудникам, чтобы заменили. Пока можно распечатать на другом "
+            "стороне, передаю сотрудникам, чтобы заменили. Пока можно распечатать на другом "
             "аппарате. Если распечатка испорчена и вы за неё платили — нажмите «😕 Не помогло»."
-        )
+        ), True
     if level is not None:
         return (
-            f"🌫 Проверил аппарат — тонера достаточно ({level}%), так что дело в чём-то другом. "
-            "Передам сотрудникам, чтобы посмотрели аппарат. Если распечатка испорчена и вы за "
-            "неё платили — нажмите «😕 Не помогло», разберёмся с возвратом."
-        )
+            f"🌫 Проверил аппарат — тонера достаточно ({level}%), так что дело, скорее всего, "
+            "в чём-то другом. Если распечатка испорчена и вы за неё платили — нажмите "
+            "«😕 Не помогло», передам сотруднику и разберёмся с возвратом."
+        ), False
     return (
-        "🌫 Сейчас не могу проверить состояние аппарата — передам сотрудникам, чтобы "
-        "посмотрели. Если распечатка испорчена и вы за неё платили — нажмите «😕 Не помогло»."
-    )
+        "🌫 Сейчас не могу проверить состояние аппарата. Если распечатка испорчена и вы за "
+        "неё платили — нажмите «😕 Не помогло», передам сотруднику."
+    ), False
 
 
 @router.callback_query(F.data.startswith("quality:"), TicketFlow.intake_qa)
-async def on_quality_chosen(callback: CallbackQuery, state: FSMContext, api: PrintBoxAPIClient) -> None:
+async def on_quality_chosen(
+    callback: CallbackQuery, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+) -> None:
     key = callback.data.split(":", 1)[1]
     data = await state.get_data()
     apparat_name_text = data.get("apparat_name_text") or ""
@@ -869,15 +880,26 @@ async def on_quality_chosen(callback: CallbackQuery, state: FSMContext, api: Pri
         return
 
     label = dict(_QUALITY_ISSUE_OPTIONS)[key]
-    reply = (
-        await _faded_print_reply(api, apparat_name_text)
-        if key == "faded"
-        else _QUALITY_REPLIES[key]
-    )
-    await _send_scripted_reply(
+    tell_staff = False
+    if key == "faded":
+        reply, tell_staff = await _faded_print_reply(api, apparat_name_text)
+    else:
+        reply = _QUALITY_REPLIES[key]
+
+    ticket_id = await _send_scripted_reply(
         state, callback.message, telegram_id, username, "print_quality", apparat_name_text,
         label, reply,
     )
+    if tell_staff:
+        await _escalate(
+            bot, api, callback.message, ticket_id, None,
+            Decision(
+                action="escalate",
+                reason="low_toner_reported",
+                staff_summary=f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}», "
+                "тонер по данным мониторинга на исходе — нужно заменить картридж.",
+            ),
+        )
     sessions.touch(telegram_id)
     await callback.answer()
 
