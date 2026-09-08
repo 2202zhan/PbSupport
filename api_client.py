@@ -45,6 +45,9 @@ class Apparat:
     name_apparat: str
     address: str
     status: str
+    # Sheets the machine believes it has left. Only v2 reports it, and it's a
+    # counter rather than a sensor - useful as corroboration, not as proof.
+    pages_left: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Apparat":
@@ -57,6 +60,7 @@ class Apparat:
             name_apparat=data["name_apparat"],
             address=data.get("address", ""),
             status=status or "",
+            pages_left=data.get("count_pages"),
         )
 
 

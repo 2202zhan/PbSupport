@@ -507,3 +507,59 @@ async def test_without_live_chat_the_message_falls_through_to_the_assistant(monk
         pass
     else:
         raise AssertionError("should have skipped to the next handler")
+
+
+class _SuppliesApi:
+    def __init__(self, pages=None, toner=None, error=None, raise_=False):
+        self.pages, self.toner, self.error, self.raise_ = pages, toner, error, raise_
+
+    async def get_apparats(self):
+        if self.raise_:
+            from api_client import PrintBoxAPIError
+            raise PrintBoxAPIError("down")
+        from api_client import Apparat
+        return [Apparat(id=1, name_apparat="Аппарат №1", address="Главный",
+                        status="online", pages_left=self.pages)]
+
+    async def get_all_printer_statuses(self):
+        if self.raise_:
+            from api_client import PrintBoxAPIError
+            raise PrintBoxAPIError("down")
+        return [{"apparat_id": 1, "toner": self.toner, "error_text": self.error}]
+
+
+async def test_low_paper_corroborates_the_report():
+    user, staff = await triage._read_supplies(_SuppliesApi(pages=3, toner={"black": 60}), "Аппарат №1")
+    assert "3 листа" in staff
+    assert "так и есть" in user
+
+
+async def test_healthy_supplies_are_reported_without_contradicting_the_user():
+    # The counter can disagree with the tray - a jammed sheet leaves the count
+    # untouched - so a healthy reading must not be used to call the user wrong.
+    user, staff = await triage._read_supplies(_SuppliesApi(pages=283, toner={"black": 51}), "Аппарат №1")
+    assert "283 листа" in staff
+    assert "передаю сотруднику" in user
+    assert "так и есть" not in user
+
+
+async def test_device_error_is_quoted_to_staff():
+    user, staff = await triage._read_supplies(
+        _SuppliesApi(pages=400, toner={"black": 60}, error="Замялась бумага"), "Аппарат №1"
+    )
+    assert "Замялась бумага" in staff
+    assert ": похоже" not in user  # no stacked colons
+
+
+async def test_unreadable_supplies_do_not_block_the_report():
+    user, staff = await triage._read_supplies(_SuppliesApi(raise_=True), "Аппарат №1")
+    assert user == ""
+    assert "недоступны" in staff
+
+
+def test_sheet_counts_use_the_right_russian_form():
+    assert triage._sheets_word(1) == "лист"
+    assert triage._sheets_word(3) == "листа"
+    assert triage._sheets_word(5) == "листов"
+    assert triage._sheets_word(11) == "листов"
+    assert triage._sheets_word(21) == "лист"

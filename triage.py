@@ -679,14 +679,70 @@ async def _suggest_alternate_apparat(api: PrintBoxAPIClient, apparat_name_text: 
     return None
 
 
+_LOW_PAGES = 50
+_LOW_TONER = 20
+
+
+async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
+    """Looks up what the machine itself reports about paper and toner, so a
+    "закончилась бумага" report doesn't reach staff as bare hearsay. Returns
+    (what to tell the user, what to tell staff)."""
+    try:
+        apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
+        statuses = await api.get_all_printer_statuses()
+    except PrintBoxAPIError:
+        logger.warning("could not read supplies for %s", apparat_name_text)
+        return "", "показания аппарата сейчас недоступны"
+    if apparat is None:
+        return "", "аппарат не найден в справочнике"
+
+    current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None) or {}
+    toner = {k: v for k, v in (current.get("toner") or {}).items() if isinstance(v, (int, float))}
+    lowest_toner = min(toner.values()) if toner else None
+    pages = apparat.pages_left
+    error_text = current.get("error_text")
+
+    findings = []
+    if pages is not None:
+        findings.append(f"{pages} {_sheets_word(pages)} бумаги")
+    if lowest_toner is not None:
+        findings.append(f"тонер {lowest_toner}%")
+    if error_text:
+        findings.append(f"аппарат сообщает: {error_text}")
+    staff_note = ", ".join(findings) if findings else "показаний от аппарата нет"
+
+    confirms = bool(error_text) or (pages is not None and pages < _LOW_PAGES) or (
+        lowest_toner is not None and lowest_toner < _LOW_TONER
+    )
+    if confirms:
+        user_note = f" Проверил — {staff_note}. Похоже, так и есть."
+    elif findings:
+        user_note = (
+            f" Проверил — по нашим счётчикам осталось {staff_note}. Счётчик может расходиться "
+            "с тем, что в лотке (например, замялся лист), поэтому передаю сотруднику."
+        )
+    else:
+        user_note = ""
+    return user_note, staff_note
+
+
+def _sheets_word(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return "листов"
+    return {1: "лист", 2: "листа", 3: "листа", 4: "листа"}.get(n % 10, "листов")
+
+
 async def _report_device_issue(
     bot: Bot, api: PrintBoxAPIClient, callback: CallbackQuery, state: FSMContext, apparat_name_text: str
 ) -> None:
-    """No payment/print to diagnose for "бумага/тонер закончились" - this is
-    just a heads-up about the apparat itself, so skip the whole diagnosis
-    pipeline and relay it straight to staff."""
+    """No payment/print to diagnose for "бумага/тонер закончились" - but the
+    machine does report its own paper and toner, so check that first and hand
+    staff the readings instead of a bare "юзер сообщает"."""
     telegram_id = str(callback.from_user.id)
     username = callback.from_user.username
+    await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
+    user_note, staff_note = await _read_supplies(api, apparat_name_text)
+
     ticket_id = await storage.create_ticket(
         telegram_id=telegram_id,
         username=username,
@@ -702,14 +758,14 @@ async def _report_device_issue(
             action="escalate",
             reason="device_issue_reported",
             staff_summary=f"📋 Юзер сообщает: на аппарате «{apparat_name_text}» закончилась "
-            "бумага или тонер - нужно пополнить.",
+            f"бумага или тонер.\nПоказания аппарата: {staff_note}.",
         ),
     )
     alternate = await _suggest_alternate_apparat(api, apparat_name_text)
     note = f" Пока можно воспользоваться аппаратом «{alternate}», если рядом." if alternate else ""
     await callback.message.edit_text(
-        f"Спасибо! Передал информацию сотруднику — на аппарате «{apparat_name_text}» проверят "
-        f"бумагу/тонер как можно скорее.{note}",
+        f"Спасибо!{user_note} Передал сотруднику — на аппарате «{apparat_name_text}» "
+        f"проверят бумагу и тонер.{note}",
         reply_markup=_main_menu_keyboard(),
     )
     sessions.forget(telegram_id)
