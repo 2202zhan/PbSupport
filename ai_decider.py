@@ -9,6 +9,7 @@ from this module to the payment API, and no setting that creates one.
 """
 
 import json
+import re
 import logging
 from dataclasses import dataclass
 
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 _SYSTEM_PROMPT = f"""\
 Ты — ассистент поддержки сервиса печати PrintBox (киоски самопечати, оплата Kaspi QR).
 
+{advice.SERVICE_OVERVIEW}
+
 {advice.USER_CONSTRAINTS}
 
 Тебе присылают "досье" по обращению юзера: что он написал, его тон в переписке, и
@@ -36,6 +39,13 @@ _SYSTEM_PROMPT = f"""\
 обоснованную рекомендацию, которую живой сотрудник прочитает и подтвердит одной кнопкой.
 Поэтому не обещай юзеру возврат как свершившийся факт и не пиши "возврат оформлен" —
 корректная формулировка всегда вида "передал на подтверждение сотруднику".
+
+Если жалоба про то, что оплата вообще не состоялась (не появился QR, банк отказал, экран
+завис до оплаты) — чека не существует, просить его нельзя: это читается как "меня не
+слушали". И не пиши в такой ситуации, что "оплаты в системе нет" как будто это упрёк.
+
+Если юзер зол, обвиняет нас или требует деньги — не проси его сформулировать жалобу
+заново. Признай ситуацию коротко, скажи, что этим займётся человек, и вызови escalate.
 
 ВАЖНО про язык: все user-facing тексты (give_advice.text, ask_clarifying_question.question,
 recommend_refund.draft_reply) должны быть на том же языке, на котором юзер пишет тебе
@@ -50,7 +60,10 @@ recommend_refund.draft_reply) должны быть на том же языке,
   жест доброй воли, чем доказанный сбой); draft_reply — готовый текст юзеру, который
   сотрудник отправит, если подтвердит (на языке юзера, без обещаний "уже вернули").
 - give_advice(text) — не возврат, а помощь юзеру — text это готовое сообщение юзеру,
-  по-человечески, без канцелярита, с конкретными шагами.
+  по-человечески, без канцелярита, с конкретными шагами. ВАЖНО: give_advice и
+  ask_clarifying_question НИКОГО не уведомляют. Поэтому в их тексте нельзя обещать
+  "передал сотрудникам", "сообщил механикам" и т.п. — юзер будет ждать ответа, которого не
+  будет. Нужно, чтобы сотрудники узнали — вызывай escalate, а не give_advice.
 - ask_clarifying_question(question) — задать юзеру ОДИН короткий уточняющий вопрос, если
   фактов реально не хватает, чтобы продолжить (например неясно, когда это было, или жалоба
   слишком общая чтобы понять причину). Не злоупотребляй - если фактов уже достаточно
@@ -244,6 +257,36 @@ _TOOLS = [
     },
 ]
 
+# The recurring failure: a model closing a case with "передал сотрудникам" from
+# give_advice / resolve, neither of which notifies anyone. The user then waits
+# for a reply that is never coming. Prompts alone kept slipping on it (including
+# in Kazakh), so the promise is also caught in code and made true by escalating
+# for real.
+_HANDOFF_VERB = (
+    r"переда(?:л|ю|м|ди|ст)|сообщ(?:ил|у|им|ит)|уведом(?:ил|лю|им)|направ(?:ил|лю|им)|"
+    r"хабарла(?:дым|ймын|йды)|жеткіз(?:дім|емін|еді)"
+)
+# Russian puts the verb first ("передал сотрудникам"), Kazakh puts it last
+# ("қызметкерлерге хабарлаймын") - accept either order.
+_HANDOFF_WHO = r"сотрудник|специалист|механик|мастер|команд|қызметкер|маман"
+# "Мы уже в курсе / уже занимаемся / скоро заменим" is the same false comfort
+# without naming anyone - the user waits for a fix that was never scheduled.
+_CLAIMS_ACTION_RE = (
+    r"уже в курсе|уже занима|уже работаем|уже решаем|скоро (?:решим|исправим|заменим|"
+    r"починим|устраним)|біз білеміз|жақын арада"
+)
+_PROMISES_HANDOFF_RE = re.compile(
+    rf"(?:({_HANDOFF_VERB})[^.!?\n]{{0,60}}({_HANDOFF_WHO}))"
+    rf"|(?:({_HANDOFF_WHO})[^.!?\n]{{0,60}}({_HANDOFF_VERB}))"
+    rf"|(?:{_CLAIMS_ACTION_RE})",
+    re.IGNORECASE,
+)
+
+
+def promises_a_handoff(text: str | None) -> bool:
+    return bool(text and _PROMISES_HANDOFF_RE.search(text))
+
+
 _FAILSAFE = Decision(
     action="escalate",
     reason="ai_decider_failed",
@@ -318,11 +361,27 @@ async def decide(evidence: Evidence) -> Decision:
         text = args.get("text")
         if not text:
             return _FAILSAFE
+        if promises_a_handoff(text):
+            logger.info("give_advice promised staff involvement - escalating for real")
+            return Decision(
+                action="escalate",
+                reason="advice_promised_staff",
+                user_message=text,
+                staff_summary=f"ИИ пообещал юзеру передать обращение сотруднику: «{text}»",
+            )
         return Decision(action="give_advice", reason="give_advice", user_message=text)
     if name == "ask_clarifying_question":
         question = args.get("question")
         if not question:
             return _FAILSAFE
+        if promises_a_handoff(question):
+            logger.info("clarifying question promised staff involvement - escalating for real")
+            return Decision(
+                action="escalate",
+                reason="clarification_promised_staff",
+                user_message=question,
+                staff_summary=f"ИИ пообещал юзеру передать обращение сотруднику: «{question}»",
+            )
         return Decision(action="ask_clarifying_question", reason="clarify", user_message=question)
     if name == "escalate":
         reason = args.get("reason")
@@ -369,10 +428,13 @@ _FOLLOWUP_SYSTEM_PROMPT = f"""\
 
 {advice.USER_CONSTRAINTS}
 
-Отдельно про технику: у тебя здесь НЕТ данных о состоянии аппарата (ни тонера, ни логов).
-Значит не строй догадок о причине поломки и тем более не давай инструкций по ремонту -
-если юзер настаивает, что техническая проблема осталась, это повод для escalate, а не для
-самодельного совета.
+Отдельно про технику: всё, что известно о состоянии аппарата, лежит в поле apparat_state.
+Если там что-то есть - опирайся на это (своими словами, без цифр и без названий наших
+систем). Если поле пустое - просто не обсуждай состояние аппарата: НИКОГДА не пиши юзеру
+"я не могу проверить", "у меня нет доступа", "удалённо не вижу" и т.п. Вместо отчёта о
+своих ограничениях прими замечание и передай его сотруднику. Догадок о причине поломки не
+строй и инструкций по ремонту не давай - если юзер настаивает, что техническая проблема
+осталась, это повод для escalate.
 
 Но если юзер просто СПРАШИВАЕТ про обслуживание ("как самому поменять тонер?", "мне
 досыпать бумагу?", "можно я перезагружу аппарат?") - это не поломка и не повод звать
@@ -387,6 +449,13 @@ _FOLLOWUP_SYSTEM_PROMPT = f"""\
 нейтрально и вежливо, закрывай обращение. Ориентир: из 10
 таких сообщений эскалировать стоит примерно 2 - в большинстве случаев должен получиться
 resolve.
+
+Про обещания: resolve НИКОГО не уведомляет - это просто твой ответ юзеру. Поэтому в
+resolve нельзя писать "передам сотрудникам", "сообщу механикам", "хабарлаймын" и т.п.,
+если поле ticket_already_with_staff = false: юзер будет ждать ответа, которого не будет.
+Нужно, чтобы сотрудники правда узнали - вызывай escalate. Если ticket_already_with_staff =
+true, заявка уже у сотрудников, и об этом можно спокойно сказать ("сотрудники уже смотрят
+аппарат").
 
 Вызови один инструмент:
 - resolve(reply_text) - твой финальный вежливый ответ юзеру, закрывающий обращение. На
@@ -435,12 +504,21 @@ _FOLLOWUP_TOOLS = [
 ]
 
 
-async def decide_followup(original_reply: str, problem_type: str, raw_text: str, user_followup: str) -> FollowupDecision:
+async def decide_followup(
+    original_reply: str,
+    problem_type: str,
+    raw_text: str,
+    user_followup: str,
+    apparat_state: str | None = None,
+    already_with_staff: bool = False,
+) -> FollowupDecision:
     payload = {
         "original_advice_or_reply": original_reply,
         "ticket_problem_type": problem_type,
         "ticket_raw_text": raw_text,
         "user_followup_after_not_helped": user_followup,
+        "apparat_state": apparat_state,
+        "ticket_already_with_staff": already_with_staff,
     }
     try:
         resp = await openai_utils.call_with_one_retry(
@@ -476,6 +554,13 @@ async def decide_followup(original_reply: str, problem_type: str, raw_text: str,
         reply_text = args.get("reply_text")
         if not reply_text:
             return _FOLLOWUP_FAILSAFE
+        if promises_a_handoff(reply_text) and not already_with_staff:
+            logger.info("followup resolve promised staff involvement - escalating for real")
+            return FollowupDecision(
+                action="escalate",
+                reason="followup_promised_staff",
+                staff_summary=f"ИИ пообещал юзеру передать обращение сотруднику: «{reply_text}»",
+            )
         return FollowupDecision(action="resolve", reply_text=reply_text)
     if name == "escalate":
         reason = args.get("reason")
