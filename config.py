@@ -40,5 +40,13 @@ class Settings(BaseSettings):
     # path.
     agent_mode: str = "off"
 
+    # How long a conversation stays live between messages. Long enough that
+    # someone who walks to another building and writes back is still in the
+    # same thread; short enough that tomorrow's unrelated question starts clean.
+    agent_conversation_ttl_minutes: int = 360
+    # Above this many messages the head of the history is folded into a summary,
+    # so a long exchange doesn't grow the prompt without bound.
+    agent_history_max_messages: int = 24
+
 
 settings = Settings()

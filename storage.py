@@ -4,7 +4,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from config import settings
@@ -50,6 +50,41 @@ CREATE TABLE IF NOT EXISTS escalations (
     resolved_at TEXT,
     created_at TEXT NOT NULL
 );
+
+-- One conversation is one continuous exchange with a user. It stays open until
+-- it goes quiet for the TTL (see agent/memory.py), so a user who comes back an
+-- hour later is not made to explain themselves from the start.
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id TEXT NOT NULL,
+    username TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    -- The head of a long history, folded into prose so the model keeps the
+    -- thread without carrying every message forward forever.
+    summary TEXT,
+    summarised_upto INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(telegram_id, status, last_at);
+
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    role TEXT NOT NULL,
+    content TEXT,
+    -- Set on tool results (which tool answered) and on assistant turns that
+    -- called tools (the calls themselves, as JSON), so the exchange can be
+    -- replayed to the model exactly as it happened.
+    tool_name TEXT,
+    tool_call_id TEXT,
+    tool_calls TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv
+    ON conversation_messages(conversation_id, id);
 
 -- One row per turn the agent takes, written whether the turn succeeded or
 -- failed. This is how the new path gets compared with the old one instead of
@@ -174,6 +209,146 @@ async def create_ticket(
         _create_ticket_sync, telegram_id, username, contact, problem_type, apparat_name,
         raw_text, payment_expected,
     )
+
+
+@dataclass
+class Conversation:
+    id: int
+    telegram_id: str
+    username: str | None
+    status: str
+    summary: str | None
+    summarised_upto: int
+    created_at: str
+    last_at: str
+
+
+@dataclass
+class ConversationMessage:
+    id: int
+    conversation_id: int
+    role: str
+    content: str | None
+    tool_name: str | None
+    tool_call_id: str | None
+    tool_calls: str | None
+    created_at: str
+
+
+def _active_conversation_sync(telegram_id: str, ttl_minutes: int) -> Conversation | None:
+    # The cutoff is computed here, against the same clock _now() writes with.
+    # Working it out from tz.now() (naive Asia/Almaty) instead compares local
+    # wall-clock against UTC rows and silently shortens the TTL by the offset.
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)).isoformat()
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM conversations
+               WHERE telegram_id = ? AND status = 'open' AND last_at >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (telegram_id, cutoff),
+        ).fetchone()
+        return Conversation(**dict(row)) if row else None
+
+
+async def active_conversation(telegram_id: str, ttl_minutes: int) -> Conversation | None:
+    return await asyncio.to_thread(_active_conversation_sync, telegram_id, ttl_minutes)
+
+
+def _start_conversation_sync(telegram_id: str, username: str | None) -> int:
+    now = _now()
+    with _connect() as conn:
+        # Whatever was open is over: one user has at most one live conversation,
+        # so a stale one can never quietly collect new messages.
+        conn.execute(
+            "UPDATE conversations SET status = 'closed' WHERE telegram_id = ? AND status = 'open'",
+            (telegram_id,),
+        )
+        cur = conn.execute(
+            "INSERT INTO conversations (telegram_id, username, created_at, last_at) VALUES (?,?,?,?)",
+            (telegram_id, username, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+async def start_conversation(telegram_id: str, username: str | None = None) -> int:
+    return await asyncio.to_thread(_start_conversation_sync, telegram_id, username)
+
+
+def _close_conversation_sync(conversation_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE conversations SET status = 'closed' WHERE id = ?", (conversation_id,))
+
+
+async def close_conversation(conversation_id: int) -> None:
+    await asyncio.to_thread(_close_conversation_sync, conversation_id)
+
+
+def _append_message_sync(
+    conversation_id: int,
+    role: str,
+    content: str | None,
+    tool_name: str | None,
+    tool_call_id: str | None,
+    tool_calls: str | None,
+) -> int:
+    now = _now()
+    with _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO conversation_messages
+                   (conversation_id, role, content, tool_name, tool_call_id, tool_calls, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (conversation_id, role, content, tool_name, tool_call_id, tool_calls, now),
+        )
+        conn.execute("UPDATE conversations SET last_at = ? WHERE id = ?", (now, conversation_id))
+        return int(cur.lastrowid)
+
+
+async def append_message(
+    conversation_id: int,
+    role: str,
+    content: str | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    tool_calls: str | None = None,
+) -> int:
+    return await asyncio.to_thread(
+        _append_message_sync, conversation_id, role, content, tool_name, tool_call_id, tool_calls
+    )
+
+
+def _conversation_messages_sync(conversation_id: int, after_id: int) -> list[ConversationMessage]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM conversation_messages WHERE conversation_id = ? AND id > ? ORDER BY id",
+            (conversation_id, after_id),
+        ).fetchall()
+        return [ConversationMessage(**dict(r)) for r in rows]
+
+
+async def conversation_messages(conversation_id: int, after_id: int = 0) -> list[ConversationMessage]:
+    return await asyncio.to_thread(_conversation_messages_sync, conversation_id, after_id)
+
+
+def _set_conversation_summary_sync(conversation_id: int, summary: str, upto_id: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET summary = ?, summarised_upto = ? WHERE id = ?",
+            (summary, upto_id, conversation_id),
+        )
+
+
+async def set_conversation_summary(conversation_id: int, summary: str, upto_id: int) -> None:
+    await asyncio.to_thread(_set_conversation_summary_sync, conversation_id, summary, upto_id)
+
+
+def _get_conversation_sync(conversation_id: int) -> Conversation | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        return Conversation(**dict(row)) if row else None
+
+
+async def get_conversation(conversation_id: int) -> Conversation | None:
+    return await asyncio.to_thread(_get_conversation_sync, conversation_id)
 
 
 def _record_agent_turn_sync(
