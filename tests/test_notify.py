@@ -28,7 +28,7 @@ def _fake_ticket(
         id=1, telegram_id="123", username="user", contact=None,
         problem_type="not_printed", apparat_name="Аппарат №1", raw_text="не печатает",
         transaction_id=transaction_id, status=status, draft_reply=draft_reply,
-        forum_topic_id=forum_topic_id, created_at="2026-06-29T12:00:00",
+        forum_topic_id=forum_topic_id, payment_expected=1, created_at="2026-06-29T12:00:00",
     )
 
 
@@ -222,7 +222,7 @@ def _plain_ticket(**overrides) -> storage.TicketRecord:
         id=12, telegram_id="943402384", username="Niidaime", contact="+77001234567",
         problem_type="payment_error", apparat_name="Аппарат №1",
         raw_text="QR-код не появился на экране", transaction_id=None, status="open",
-        draft_reply=None, forum_topic_id=None, created_at="2026-06-20T12:00:00",
+        draft_reply=None, forum_topic_id=None, payment_expected=1, created_at="2026-06-20T12:00:00",
     )
     defaults.update(overrides)
     return storage.TicketRecord(**defaults)

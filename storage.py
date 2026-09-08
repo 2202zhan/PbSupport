@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     status TEXT NOT NULL DEFAULT 'open',
     draft_reply TEXT,
     forum_topic_id INTEGER,
+    payment_expected INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
 
@@ -82,6 +83,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tickets ADD COLUMN draft_reply TEXT")
         if "forum_topic_id" not in existing:
             conn.execute("ALTER TABLE tickets ADD COLUMN forum_topic_id INTEGER")
+        if "payment_expected" not in existing:
+            conn.execute(
+                "ALTER TABLE tickets ADD COLUMN payment_expected INTEGER NOT NULL DEFAULT 1"
+            )
 
 
 @dataclass
@@ -97,6 +102,10 @@ class TicketRecord:
     status: str
     draft_reply: str | None
     forum_topic_id: int | None
+    # False for complaints where no payment could have happened yet (the QR
+    # never appeared, the bank refused, the file never uploaded). Asking those
+    # users for a receipt reads as not having listened to them.
+    payment_expected: int
     created_at: str
 
 
@@ -107,12 +116,16 @@ def _create_ticket_sync(
     problem_type: str,
     apparat_name: str | None,
     raw_text: str | None,
+    payment_expected: bool,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
             "INSERT INTO tickets (telegram_id, username, contact, problem_type, apparat_name, "
-            "raw_text, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
-            (telegram_id, username, contact, problem_type, apparat_name, raw_text, _now()),
+            "raw_text, status, payment_expected, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+            (
+                telegram_id, username, contact, problem_type, apparat_name, raw_text,
+                int(payment_expected), _now(),
+            ),
         )
         return cur.lastrowid
 
@@ -124,9 +137,11 @@ async def create_ticket(
     problem_type: str,
     apparat_name: str | None,
     raw_text: str | None,
+    payment_expected: bool = True,
 ) -> int:
     return await asyncio.to_thread(
-        _create_ticket_sync, telegram_id, username, contact, problem_type, apparat_name, raw_text
+        _create_ticket_sync, telegram_id, username, contact, problem_type, apparat_name,
+        raw_text, payment_expected,
     )
 
 

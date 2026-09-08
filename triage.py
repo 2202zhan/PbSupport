@@ -633,6 +633,7 @@ async def _send_scripted_reply(
     apparat_name_text: str,
     raw_text: str,
     reply_text: str,
+    payment_expected: bool = True,
 ) -> None:
     """For sub-options where the cause is already known from the button alone (or
     a quick live check) - no transaction could exist or there's nothing useful to
@@ -644,6 +645,7 @@ async def _send_scripted_reply(
         problem_type=problem_type,
         apparat_name=apparat_name_text,
         raw_text=raw_text,
+        payment_expected=payment_expected,
     )
     await storage.record_decision(ticket_id, {}, None, None, None, "give_advice")
     await message.answer(reply_text, reply_markup=_feedback_keyboard(ticket_id))
@@ -687,6 +689,7 @@ async def _report_device_issue(
         problem_type="device_issue",
         apparat_name=apparat_name_text,
         raw_text="Юзер сообщает: бумага/тонер закончились",
+        payment_expected=False,
     )
     await _escalate(
         bot, api, callback.message, ticket_id, None,
@@ -760,16 +763,18 @@ async def on_payment_error_type_chosen(callback: CallbackQuery, state: FSMContex
         await callback.message.edit_text("🔍 Проверяю доступность оплаты на аппарате...")
         is_available = await _check_qr_payment_availability(api, apparat_name_text)
         reply_text = _QR_OK_REPLY if is_available else _QR_BANK_SIDE_REPLY
+        # No QR means no payment could have gone through - never ask this user
+        # for a receipt later.
         await _send_scripted_reply(
             state, callback.message, telegram_id, username, "payment_error", apparat_name_text,
-            "QR-код не появился на экране", reply_text,
+            "QR-код не появился на экране", reply_text, payment_expected=False,
         )
         return
 
     if key == "bank_error":
         await _send_scripted_reply(
             state, callback.message, telegram_id, username, "payment_error", apparat_name_text,
-            "Ошибка в приложении банка при оплате", _BANK_ERROR_REPLY,
+            "Ошибка в приложении банка при оплате", _BANK_ERROR_REPLY, payment_expected=False,
         )
         await callback.answer()
         return
@@ -803,7 +808,11 @@ async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext, bot
 
     label = dict(_UPLOAD_ISSUE_OPTIONS)[key]
     reply_text = _UPLOAD_FORMAT_REPLY if key == "upload_error" else _NO_CODE_REPLY
-    await _send_scripted_reply(state, callback.message, telegram_id, username, "upload_failed", apparat_name_text, label, reply_text)
+    # Uploading happens before payment, so there is no receipt to ask for.
+    await _send_scripted_reply(
+        state, callback.message, telegram_id, username, "upload_failed", apparat_name_text,
+        label, reply_text, payment_expected=False,
+    )
     await callback.answer()
 
 
@@ -1599,6 +1608,14 @@ async def on_nothelped_detail_provided(
         pending_escalation_reason=followup.reason,
         pending_escalation_summary=followup.staff_summary,
     )
+
+    if ticket_record is not None and not ticket_record.payment_expected:
+        # The complaint is about something that happens before paying (QR never
+        # appeared, bank refused, file never uploaded) - there is no receipt to
+        # ask for, and asking anyway reads as not having listened.
+        await _proceed_after_escalation_receipt(message, state, bot, api, telegram_id)
+        return
+
     await state.set_state(TicketFlow.awaiting_escalation_receipt)
     await message.answer(
         "Если есть чек оплаты — пришлите, поможет сотруднику быстрее разобраться.",

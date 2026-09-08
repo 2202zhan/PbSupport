@@ -332,3 +332,94 @@ def test_every_user_facing_prompt_forbids_self_service_advice():
     ]:
         assert "картридж" in prompt, name
         assert "НИКОГДА не советуй" in prompt, name
+
+
+class _FakeStatusMessage:
+    def __init__(self):
+        self.texts: list[str] = []
+
+    async def edit_text(self, text, reply_markup=None):
+        self.texts.append(text)
+
+
+class _RecordingMessage(_FakeMessage):
+    """_FakeMessage whose answer() returns something editable, since the
+    follow-up handler narrates progress into the message it just sent."""
+
+    async def answer(self, text, reply_markup=None):
+        self.answered_with.append(text)
+        return _FakeStatusMessage()
+
+
+class _FakeState:
+    def __init__(self, data):
+        self._data = dict(data)
+        self.state = None
+
+    async def get_data(self):
+        return dict(self._data)
+
+    async def update_data(self, **kwargs):
+        self._data.update(kwargs)
+
+    async def set_state(self, state):
+        self.state = state
+
+    async def clear(self):
+        self._data.clear()
+
+
+def _record(**overrides) -> storage.TicketRecord:
+    defaults = dict(
+        id=1, telegram_id="123", username="u", contact="+77000000000",
+        problem_type="payment_error", apparat_name="Аппарат №1",
+        raw_text="QR-код не появился на экране", transaction_id=None, status="escalated",
+        draft_reply=None, forum_topic_id=None, payment_expected=1,
+        created_at="2026-09-08T00:00:00",
+    )
+    defaults.update(overrides)
+    return storage.TicketRecord(**defaults)
+
+
+def _escalating_followup(monkeypatch, ticket):
+    monkeypatch.setattr(triage, "_STAGE_PAUSE_SECONDS", 0)
+
+    async def _decide(**_):
+        return triage.ai_decider.FollowupDecision(action="escalate", reason="r", staff_summary="s")
+
+    async def _get_ticket(_id):
+        return ticket
+
+    monkeypatch.setattr(triage.ai_decider, "decide_followup", _decide)
+    monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
+
+
+async def test_pre_payment_complaint_skips_the_receipt_question(monkeypatch):
+    # "QR не появился" means no payment happened, so no receipt can exist -
+    # asking for one reads as not having listened to the complaint.
+    _escalating_followup(monkeypatch, _record(payment_expected=0))
+    reached_phone = []
+
+    async def _proceed(message, state, bot, api, telegram_id):
+        reached_phone.append(True)
+
+    monkeypatch.setattr(triage, "_proceed_after_escalation_receipt", _proceed)
+
+    message = _RecordingMessage("оплата кюар ыстемид")
+    await triage.on_nothelped_detail_provided(
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
+    )
+
+    assert reached_phone == [True]
+    assert not any("чек" in t.lower() for t in message.answered_with)
+
+
+async def test_paid_complaint_still_asks_for_the_receipt(monkeypatch):
+    _escalating_followup(monkeypatch, _record(problem_type="not_printed", payment_expected=1))
+
+    message = _RecordingMessage("деньги списались, ничего не вышло")
+    await triage.on_nothelped_detail_provided(
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
+    )
+
+    assert any("чек" in t.lower() for t in message.answered_with)
