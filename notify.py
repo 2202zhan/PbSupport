@@ -41,6 +41,9 @@ _SHORT_PROBLEM = {
     "upload_failed": "файл не загрузился",
     "device_issue": "бумага/тонер",
     "other": "другое",
+    # The agent doesn't pick from a menu - it writes what happened in the
+    # summary instead, so the card is labelled by where it came from.
+    "agent": "разговор",
 }
 
 _FALLBACK_REFUND_REPLY = (

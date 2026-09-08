@@ -16,6 +16,7 @@ import notify
 import sessions
 import storage
 import triage
+from agent.router import router as agent_router
 from api_client import PrintBoxAPIClient
 from config import settings
 
@@ -93,7 +94,7 @@ async def main() -> None:
     # Ahead of triage: whoever the gate admits is handled by the agent and
     # never reaches the menu tree. Everyone else falls through unchanged.
     logger.info(agent.describe_mode())
-    dp.include_router(agent.router)
+    dp.include_router(agent_router)
     dp.include_router(triage.router)
     dp.include_router(notify.router)
     dp.include_router(csat.router)

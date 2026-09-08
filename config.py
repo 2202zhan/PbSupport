@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     # Above this many messages the head of the history is folded into a summary,
     # so a long exchange doesn't grow the prompt without bound.
     agent_history_max_messages: int = 24
+    # Two roles, deliberately: the conversation has to feel fast, the money
+    # decision has to be right. Both point at the strong model until phase 8
+    # measures whether a cheaper one holds up in conversation.
+    agent_chat_model: str = "gpt-4o"
+    agent_verdict_model: str = "gpt-4o"
+    # Budgets for one turn. Whatever happens, the turn ends - with an answer,
+    # with a human, but never with silence.
+    agent_max_model_calls: int = 3
+    agent_max_tool_calls: int = 6
+    agent_turn_timeout_seconds: int = 45
 
 
 settings = Settings()

@@ -68,7 +68,7 @@ def test_the_agent_router_is_registered_before_triage():
     import inspect
 
     source = inspect.getsource(bot_module.main)
-    assert source.index("include_router(agent.router)") < source.index("include_router(triage.router)")
+    assert source.index("include_router(agent_router)") < source.index("include_router(triage.router)")
 
 
 def test_the_router_only_admits_users_the_gate_allows(monkeypatch):
