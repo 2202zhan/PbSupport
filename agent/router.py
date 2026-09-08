@@ -8,6 +8,7 @@ The runtime decides; this module carries the decision out. Every path through
 here ends with the user having been sent something.
 """
 
+import json
 import logging
 
 from aiogram import Bot, F, Router
@@ -16,7 +17,7 @@ from aiogram.types import CallbackQuery, Message
 
 import notify
 import storage
-from agent import memory, ui
+from agent import files, memory, ui
 from agent.gate import agent_enabled_for
 from agent.runtime import run_turn
 from agent.types import TurnContext, TurnResult
@@ -68,12 +69,12 @@ async def on_text(message: Message, bot: Bot, api: PrintBoxAPIClient) -> None:
 
 @router.message(F.photo | F.document)
 async def on_file(message: Message, bot: Bot, api: PrintBoxAPIClient) -> None:
-    """Files are read properly in phase 6. Until then they are at least
-    acknowledged here rather than falling through to the menu bot's handlers,
-    which would answer an agent conversation with a state machine's question."""
-    kind = "фото" if message.photo else "документ"
-    caption = f" с подписью: {message.caption}" if message.caption else ""
-    await _handle(bot, api, message, f"[юзер прислал {kind}{caption}; прочитать его я пока не умею]")
+    """A receipt is read the moment it arrives, asked for or not - people send
+    proof when they have it, not when they are prompted."""
+    telegram_id = str(message.from_user.id)
+    conversation = await memory.current_conversation(telegram_id, message.from_user.username)
+    fact = await files.read_and_remember(bot, message, conversation.id)
+    await _handle(bot, api, message, fact)
 
 
 @router.callback_query(F.data.startswith(ui.CALLBACK_PREFIX))
@@ -162,6 +163,7 @@ async def deliver(
 
     try:
         ticket_id = await _open_ticket(message, conversation_id, user)
+        await _attach_receipt(bot, ticket_id, conversation_id)
         await notify.send_plain_escalation(
             bot,
             settings.support_staff_chat_id,
@@ -181,6 +183,21 @@ async def deliver(
         # The user has already been told a human is coming, so this must not
         # look like a normal reply - it is a hole, and it has to be loud.
         logger.exception("could not escalate agent conversation %s", conversation_id)
+
+
+async def _attach_receipt(bot: Bot, ticket_id: int, conversation_id: int) -> None:
+    """The file the user sent belongs on the card - a summary of a receipt is
+    not a receipt, and staff have to be able to look at it."""
+    conversation = await storage.get_conversation(conversation_id)
+    if conversation is None or not conversation.receipt:
+        return
+    stored = json.loads(conversation.receipt)
+    try:
+        await notify.forward_receipt(
+            bot, ticket_id, stored["file_id"], bool(stored.get("is_document"))
+        )
+    except Exception:
+        logger.warning("could not attach the receipt to ticket %s", ticket_id, exc_info=True)
 
 
 async def _open_ticket(message: Message, conversation_id: int, user) -> int:

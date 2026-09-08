@@ -29,17 +29,17 @@ def test_is_too_old_true_for_receipt_from_two_days_ago(monkeypatch):
     now = datetime(2026, 6, 20, 23, 55, 0)
     monkeypatch.setattr(triage.tz, "now", lambda: now)
     receipt_paid_at = datetime(2026, 6, 18, 11, 58, 12)  # ~2.5 days earlier
-    assert triage._is_too_old(receipt_paid_at) is True
+    assert triage.receipts.is_stale(receipt_paid_at) is True
 
 
 def test_is_too_old_false_for_recent_time(monkeypatch):
     now = datetime(2026, 6, 20, 23, 55, 0)
     monkeypatch.setattr(triage.tz, "now", lambda: now)
-    assert triage._is_too_old(now - timedelta(hours=2)) is False
+    assert triage.receipts.is_stale(now - timedelta(hours=2)) is False
 
 
 def test_is_too_old_false_when_no_hint_time():
-    assert triage._is_too_old(None) is False
+    assert triage.receipts.is_stale(None) is False
 
 
 def test_build_intake_summary_includes_sub_issue_fields():
@@ -479,7 +479,7 @@ async def test_a_receipt_from_months_ago_is_refused_not_escalated(monkeypatch):
     async def _escalate(*args, **kwargs):
         escalated.append(True)
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage, "_escalate", _escalate)
     monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 14, 0))
     monkeypatch.setattr(triage.storage, "set_ticket_status", lambda *a: asyncio.sleep(0))
@@ -508,7 +508,7 @@ async def test_a_recent_receipt_still_triggers_a_second_look(monkeypatch):
     async def _get_ticket(_id):
         return _record(problem_type="not_printed", apparat_name="Аппарат №1")
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
     monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
     monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 14, 0))
@@ -539,7 +539,7 @@ async def test_receipt_sent_in_reply_to_the_ai_question_is_processed(monkeypatch
     async def _get_ticket(_id):
         return _record(problem_type="not_printed", apparat_name="Аппарат №1")
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
     monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
     monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 21, 11))
@@ -569,7 +569,7 @@ async def test_unparsable_receipt_in_dialogue_still_reaches_staff(monkeypatch):
     async def _get_ticket(_id):
         return _record(problem_type="not_printed")
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
     monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
 
@@ -601,7 +601,7 @@ async def test_a_receipt_sent_after_not_helped_is_read_not_refused(monkeypatch):
         seen.update(kwargs)
         return triage.ai_decider.FollowupDecision(action="escalate", reason="r", staff_summary="s")
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage.ai_decider, "decide_followup", _decide)
 
     message = _RecordingMessage(None)
@@ -626,7 +626,7 @@ async def test_a_stale_receipt_after_not_helped_is_still_refused(monkeypatch):
     async def _refuse(message, state, ticket_id, paid_at):
         refused.append(paid_at)
 
-    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage.receipts, "extract", _extract)
     monkeypatch.setattr(triage, "_refuse_stale_receipt", _refuse)
 
     await triage.on_nothelped_detail_receipt(

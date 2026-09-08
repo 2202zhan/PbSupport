@@ -26,7 +26,7 @@ import concierge
 import csat
 import diagnosis
 import notify
-import receipt_parser
+import receipts
 import sessions
 import storage
 import tz
@@ -178,13 +178,6 @@ _OLD_WHEN_TEXT_RE = re.compile(r"вчера|позавчера|недел|мес
 
 def _custom_when_indicates_old(text: str) -> bool:
     return bool(_OLD_WHEN_TEXT_RE.search(text))
-
-
-def _is_too_old(manual_hint_time) -> bool:
-    """True once a resolved incident time (bucket, custom text, or a parsed
-    receipt) is more than 24h in the past - the receipt is ground truth and can
-    reveal this even when the user's own "when" answer suggested otherwise."""
-    return manual_hint_time is not None and tz.now() - manual_hint_time > timedelta(hours=24)
 
 
 _AMOUNT_TEXT_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
@@ -1041,30 +1034,6 @@ async def on_no_match_receipt_skipped(callback: CallbackQuery, state: FSMContext
     await callback.answer()
 
 
-async def _extract_receipt_data(
-    bot: Bot, message: Message
-) -> tuple[str, bool, receipt_parser.ReceiptData | None]:
-    """Returns (file_id, is_document, parsed). Only PDFs get parsed - photos are
-    accepted (for a human to look at later) but there's no OCR to read them here."""
-    if message.document:
-        file_id = message.document.file_id
-        is_pdf = message.document.mime_type == "application/pdf" or (
-            message.document.file_name or ""
-        ).lower().endswith(".pdf")
-        if not is_pdf:
-            return file_id, True, None
-        try:
-            buf = await bot.download(file_id)
-            parsed = receipt_parser.parse_receipt_pdf(buf.read())
-        except Exception:
-            logger.exception("failed to download/parse receipt PDF")
-            return file_id, True, None
-        return file_id, True, (parsed if parsed.is_useful else None)
-    if message.photo:
-        return message.photo[-1].file_id, False, None
-    return "", False, None
-
-
 async def _refuse_stale_receipt(message: Message, state: FSMContext, ticket_id: int, paid_at) -> None:
     """The receipt is the ground truth about when this happened, and it can
     contradict the ticket outright - a payment from three months ago means the
@@ -1082,7 +1051,7 @@ async def _refuse_stale_receipt(message: Message, state: FSMContext, ticket_id: 
 
 @router.message(TicketFlow.awaiting_receipt_photo, F.photo | F.document)
 async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient) -> None:
-    file_id, is_document, parsed = await _extract_receipt_data(bot, message)
+    file_id, is_document, parsed = await receipts.extract(bot, message)
     if not file_id:
         await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
         return
@@ -1090,7 +1059,7 @@ async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api
     data = await state.get_data()
     if data.get("awaiting_post_diagnosis_receipt"):
         ticket_id = data["ticket_id"]
-        if parsed is not None and _is_too_old(parsed.paid_at):
+        if parsed is not None and receipts.is_stale(parsed.paid_at):
             await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
             return
 
@@ -1292,7 +1261,7 @@ async def _finalize_intake(
     # question via reclassification) - catch it here too, not just at the
     # when-button step, since this is the last point before we'd run a full
     # (pointless) investigation on an un-actionable ticket.
-    if _is_too_old(manual_hint_time):
+    if receipts.is_stale(manual_hint_time):
         await _close_as_too_old(
             message, state, telegram_id, username, manual_hint_time.strftime("%d.%m.%Y %H:%M")
         )
@@ -1666,14 +1635,14 @@ async def on_nothelped_detail_receipt(
     """"Не помогло" answered with a receipt instead of words. Telling someone
     who just sent proof of payment to "напишите текстом" reads as not having
     looked at it - take the file, and let the same follow-up logic decide."""
-    file_id, is_document, parsed = await _extract_receipt_data(bot, message)
+    file_id, is_document, parsed = await receipts.extract(bot, message)
     if not file_id:
         await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
         return
 
     data = await state.get_data()
     ticket_id = data["ticket_id"]
-    if parsed is not None and _is_too_old(parsed.paid_at):
+    if parsed is not None and receipts.is_stale(parsed.paid_at):
         await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
         return
 
@@ -1767,7 +1736,7 @@ async def on_escalation_receipt_photo_requested(callback: CallbackQuery) -> None
 async def on_escalation_receipt_provided(
     message: Message, state: FSMContext, bot: Bot
 ) -> None:
-    file_id, is_document, _ = await _extract_receipt_data(bot, message)
+    file_id, is_document, _ = await receipts.extract(bot, message)
     if file_id:
         await state.update_data(
             pending_escalation_receipt_file_id=file_id, pending_escalation_receipt_is_document=is_document
@@ -1882,14 +1851,14 @@ async def on_followup_receipt(message: Message, state: FSMContext, bot: Bot, api
     """A receipt sent in reply to the AI's own "пришлите чек" question. Without
     this it fell through to on_followup_message, which reads message.text -
     None for a document - so the model saw nothing new and asked again."""
-    file_id, is_document, parsed = await _extract_receipt_data(bot, message)
+    file_id, is_document, parsed = await receipts.extract(bot, message)
     if not file_id:
         await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
         return
 
     data = await state.get_data()
     ticket_id = data["ticket_id"]
-    if parsed is not None and _is_too_old(parsed.paid_at):
+    if parsed is not None and receipts.is_stale(parsed.paid_at):
         await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
         return
 
@@ -1976,7 +1945,7 @@ async def on_requested_receipt(message: Message, bot: Bot) -> None:
         )
         return
 
-    file_id, is_document, _ = await _extract_receipt_data(bot, message)
+    file_id, is_document, _ = await receipts.extract(bot, message)
     if not file_id:
         await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
         return

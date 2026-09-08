@@ -222,15 +222,3 @@ async def test_what_the_agent_is_waiting_for_is_remembered(db):
         TurnResult(kind="reply", text="Пришлите чек", expect="file"),
     )
     assert (await storage.get_conversation(conversation)).expecting == "file"
-
-
-async def test_a_file_reaches_the_agent_and_not_the_menu_bot(db, monkeypatch):
-    # Falling through to triage would answer an agent conversation with a state
-    # machine's question.
-    seen = _turn(monkeypatch, TurnResult(kind="reply", text="Принял."))
-    message = _Message(text=None)
-    message.photo = [object()]
-    message.document = None
-    message.caption = "вот чек"
-    await agent_router.on_file(message, None, None)
-    assert "фото" in seen["text"] and "вот чек" in seen["text"]

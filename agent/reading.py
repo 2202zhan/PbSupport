@@ -7,15 +7,18 @@ escalation card still gets the exact reading.
 """
 
 import logging
+from datetime import datetime, timedelta
+
+import json
 
 import apparats
 import diagnosis
 import guard_rules
+import storage
 import tz
 from agent.registry import ToolError, ToolSpec
 from agent.types import TurnContext
 from api_client import PrintBoxAPIError
-from datetime import datetime  # noqa: F401  (used in a string annotation)
 
 logger = logging.getLogger(__name__)
 
@@ -235,11 +238,34 @@ _BLOCKER_WORDS = {
 }
 
 
+async def _stored_receipt(ctx: TurnContext) -> dict | None:
+    conversation = await storage.get_conversation(ctx.conversation_id)
+    if conversation is None or not conversation.receipt:
+        return None
+    try:
+        return json.loads(conversation.receipt)
+    except json.JSONDecodeError:
+        return None
+
+
 async def _investigate_order(args: dict, ctx: TurnContext) -> dict:
     if ctx.on_progress:
         await ctx.on_progress("🔍 Проверяю заказ по нашим данным…")
 
     hint_time = _parse_when(args.get("when"))
+    amount = _as_amount(args.get("amount"))
+    precise = False
+    receipt = await _stored_receipt(ctx)
+    if receipt:
+        # The receipt is ground truth: an exact amount and timestamp find the
+        # payment even when the user misremembered when it happened, and are
+        # precise enough to search beyond this account.
+        amount = receipt.get("amount") or amount
+        paid_at = receipt.get("paid_at")
+        if paid_at:
+            hint_time = datetime.fromisoformat(paid_at)
+            precise = True
+
     ticket = diagnosis.TicketInput(
         problem_type="not_printed",
         apparat_name_text=(args.get("apparat") or "").strip(),
@@ -248,8 +274,10 @@ async def _investigate_order(args: dict, ctx: TurnContext) -> dict:
         contact=None,
         raw_text=ctx.user_message,
         submitted_at=tz.now(),
-        manual_hint_amount=_as_amount(args.get("amount")),
+        manual_hint_amount=amount,
         manual_hint_time=hint_time,
+        manual_hint_time_tolerance_seconds=120 if precise else 900,
+        manual_hint_is_precise=precise,
     )
     try:
         evidence = await diagnosis.gather_evidence(ctx.api, ticket)
@@ -324,14 +352,12 @@ _WHEN_MINUTES = {
 }
 
 
-def _parse_when(raw) -> "datetime | None":
+def _parse_when(raw) -> datetime | None:
     if not raw or not isinstance(raw, str):
         return None
     minutes = _WHEN_MINUTES.get(raw.strip().lower())
     if minutes is None:
         return None
-    from datetime import timedelta
-
     return tz.now() - timedelta(minutes=minutes)
 
 

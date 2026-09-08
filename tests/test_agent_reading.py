@@ -55,6 +55,16 @@ def daytime(monkeypatch):
     monkeypatch.setattr(apparats.tz, "now", lambda: datetime(2026, 9, 9, 14, 0))
 
 
+@pytest.fixture(autouse=True)
+def db(tmp_path, monkeypatch):
+    # investigate_order reads the conversation for a stored receipt; without
+    # this the suite would reach for the running bot's own database.
+    monkeypatch.setattr("storage.settings.support_bot_db_path", str(tmp_path / "t.sqlite3"))
+    import storage
+
+    storage.init_db()
+
+
 async def test_service_facts_come_from_the_curated_list():
     answer = await SERVICE_INFO.run({"topic": "hours"}, None)
     assert "8:00" in answer["факт"] and "19:00" in answer["факт"]

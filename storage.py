@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS conversations (
     summarised_upto INTEGER NOT NULL DEFAULT 0,
     -- What the agent asked for last: "text", "choice", "file" or "none".
     expecting TEXT NOT NULL DEFAULT 'text',
+    -- The receipt this person sent, as JSON: the Telegram file id so it can be
+    -- put on the staff card later, and whatever was read out of it. Kept on the
+    -- conversation rather than on a turn, because the escalation that needs it
+    -- may be several messages away.
+    receipt TEXT,
     created_at TEXT NOT NULL,
     last_at TEXT NOT NULL
 );
@@ -166,6 +171,8 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE conversations ADD COLUMN expecting TEXT NOT NULL DEFAULT 'text'"
             )
+        if conversation_columns and "receipt" not in conversation_columns:
+            conn.execute("ALTER TABLE conversations ADD COLUMN receipt TEXT")
 
 
 @dataclass
@@ -239,6 +246,7 @@ class Conversation:
     # What the agent asked the user for last, so a photo arriving next is read
     # as an answer to that question rather than as a stray file.
     expecting: str
+    receipt: str | None
     created_at: str
     last_at: str
 
@@ -409,6 +417,19 @@ def _set_conversation_expecting_sync(conversation_id: int, expecting: str) -> No
 
 async def set_conversation_expecting(conversation_id: int, expecting: str) -> None:
     await asyncio.to_thread(_set_conversation_expecting_sync, conversation_id, expecting)
+
+
+def _set_conversation_receipt_sync(conversation_id: int, receipt: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET receipt = ? WHERE id = ?", (receipt, conversation_id)
+        )
+
+
+async def set_conversation_receipt(conversation_id: int, receipt: dict) -> None:
+    await asyncio.to_thread(
+        _set_conversation_receipt_sync, conversation_id, json.dumps(receipt, ensure_ascii=False, default=str)
+    )
 
 
 def _record_agent_turn_sync(
