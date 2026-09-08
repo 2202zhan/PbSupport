@@ -181,7 +181,12 @@ class PrintBoxAPIClient:
         resp = await self._request("GET", "/v2/admin/printers/summary")
         return resp.json()["summary"]
 
-    async def request_device_logs(self, apparat_id: int, lines: int = 200, log_type: str = "print") -> None:
+    # Measured on Аппарат №3: 200 lines reach back about 2.5 hours, 1000 cover
+    # the whole working day (the device starts a fresh file at power-on, so
+    # asking for more than that returns the same thing). Tickets are accepted
+    # for 24 hours, so the old default left anything older than an afternoon
+    # with no logs to check at all.
+    async def request_device_logs(self, apparat_id: int, lines: int = 1000, log_type: str = "print") -> None:
         await self._request(
             "POST",
             f"/v2/device/{apparat_id}/request-logs",
