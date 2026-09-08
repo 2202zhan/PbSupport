@@ -16,7 +16,7 @@ from aiogram.types import CallbackQuery, Message
 
 import notify
 import storage
-from agent import memory
+from agent import memory, ui
 from agent.gate import agent_enabled_for
 from agent.runtime import run_turn
 from agent.types import TurnContext, TurnResult
@@ -62,36 +62,79 @@ async def on_start(message: Message) -> None:
 
 @router.message(F.text)
 async def on_text(message: Message, bot: Bot) -> None:
-    telegram_id = str(message.from_user.id)
+    await _handle(bot, message, message.text)
+
+
+@router.message(F.photo | F.document)
+async def on_file(message: Message, bot: Bot) -> None:
+    """Files are read properly in phase 6. Until then they are at least
+    acknowledged here rather than falling through to the menu bot's handlers,
+    which would answer an agent conversation with a state machine's question."""
+    kind = "фото" if message.photo else "документ"
+    caption = f" с подписью: {message.caption}" if message.caption else ""
+    await _handle(bot, message, f"[юзер прислал {kind}{caption}; прочитать его я пока не умею]")
+
+
+@router.callback_query(F.data.startswith(ui.CALLBACK_PREFIX))
+async def on_button(callback: CallbackQuery, bot: Bot) -> None:
+    telegram_id = str(callback.from_user.id)
+    conversation = await memory.current_conversation(telegram_id, callback.from_user.username)
+    label = await ui.resolve(callback.data, conversation.id)
+    await callback.answer()
+    if label is None:
+        # A button from an older conversation. Say so instead of quietly
+        # answering something the user did not ask now.
+        await callback.message.answer("Это из прошлого разговора. Напишите, что нужно сейчас.")
+        return
+    # Taking the keyboard away stops the same choice being sent twice and
+    # leaves the thread readable.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        logger.debug("could not clear the keyboard", exc_info=True)
+    await _handle(bot, callback.message, label, from_user=callback.from_user)
+
+
+async def _handle(bot: Bot, message: Message, text: str, from_user=None) -> None:
+    user = from_user or message.from_user
+    telegram_id = str(user.id)
     # People send "не печатает" and "аппарат 3" a second apart; without this
     # the two turns read the same history and answer each other's question.
     async with memory.one_turn_at_a_time(telegram_id):
-        conversation = await memory.current_conversation(telegram_id, message.from_user.username)
-        await memory.remember_user_message(conversation.id, message.text)
+        conversation = await memory.current_conversation(telegram_id, user.username)
+        await memory.remember_user_message(conversation.id, text)
         result = await run_turn(
             TurnContext(
                 telegram_id=telegram_id,
-                username=message.from_user.username,
+                username=user.username,
                 conversation_id=conversation.id,
-                user_message=message.text,
+                user_message=text,
             )
         )
-        await deliver(bot, message, conversation.id, result)
+        await deliver(bot, message, conversation.id, result, user=user)
 
 
-async def deliver(bot: Bot, message: Message, conversation_id: int, result: TurnResult) -> None:
+async def deliver(
+    bot: Bot, message: Message, conversation_id: int, result: TurnResult, user=None
+) -> None:
     """Carries out what the turn decided. Whatever else happens, the user is
     answered - a turn that reached a human still has to say so."""
-    if result.text:
-        await message.answer(result.text)
-    elif result.needs_staff:
-        await message.answer(_BROKEN)
+    user = user or message.from_user
+    text = result.text or (_BROKEN if result.needs_staff else None)
+    if text:
+        # No keyboard once a human is on the case: the next message comes from
+        # them, and quick answers to the bot would only get in the way.
+        markup = None if result.needs_staff else await ui.keyboard(conversation_id, result.buttons)
+        await message.answer(text, reply_markup=markup)
+    await storage.set_conversation_expecting(
+        conversation_id, "none" if result.needs_staff else result.expect
+    )
 
     if not result.needs_staff:
         return
 
     try:
-        ticket_id = await _open_ticket(message, conversation_id)
+        ticket_id = await _open_ticket(message, conversation_id, user)
         await notify.send_plain_escalation(
             bot,
             settings.support_staff_chat_id,
@@ -108,17 +151,17 @@ async def deliver(bot: Bot, message: Message, conversation_id: int, result: Turn
         logger.exception("could not escalate agent conversation %s", conversation_id)
 
 
-async def _open_ticket(message: Message, conversation_id: int) -> int:
+async def _open_ticket(message: Message, conversation_id: int, user) -> int:
     """A ticket is created here, at the moment a human is actually needed -
     not at the start of every conversation."""
     transcript = await memory.history(conversation_id)
     said = [m["content"] for m in transcript if m.get("role") == "user" and m.get("content")]
     return await storage.create_ticket(
-        telegram_id=str(message.from_user.id),
-        username=message.from_user.username,
+        telegram_id=str(user.id),
+        username=user.username,
         contact=None,
         problem_type="agent",
         apparat_name=None,
-        raw_text="\n".join(said[-5:]) or message.text,
+        raw_text="\n".join(said[-5:]) or (message.text or ""),
         payment_expected=False,
     )

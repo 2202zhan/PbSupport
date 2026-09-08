@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- thread without carrying every message forward forever.
     summary TEXT,
     summarised_upto INTEGER NOT NULL DEFAULT 0,
+    -- What the agent asked for last: "text", "choice", "file" or "none".
+    expecting TEXT NOT NULL DEFAULT 'text',
     created_at TEXT NOT NULL,
     last_at TEXT NOT NULL
 );
@@ -85,6 +87,16 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv
     ON conversation_messages(conversation_id, id);
+
+-- A tapped button has to be resolved back into what it said, and Telegram
+-- only carries 64 bytes of callback data - not enough for a Russian label. So
+-- the label lives here and the button carries its id.
+CREATE TABLE IF NOT EXISTS conversation_buttons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
 -- One row per turn the agent takes, written whether the turn succeeded or
 -- failed. This is how the new path gets compared with the old one instead of
@@ -149,6 +161,11 @@ def init_db() -> None:
             )
         if "live_chat" not in existing:
             conn.execute("ALTER TABLE tickets ADD COLUMN live_chat INTEGER NOT NULL DEFAULT 0")
+        conversation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+        if conversation_columns and "expecting" not in conversation_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN expecting TEXT NOT NULL DEFAULT 'text'"
+            )
 
 
 @dataclass
@@ -219,6 +236,9 @@ class Conversation:
     status: str
     summary: str | None
     summarised_upto: int
+    # What the agent asked the user for last, so a photo arriving next is read
+    # as an answer to that question rather than as a stray file.
+    expecting: str
     created_at: str
     last_at: str
 
@@ -349,6 +369,46 @@ def _get_conversation_sync(conversation_id: int) -> Conversation | None:
 
 async def get_conversation(conversation_id: int) -> Conversation | None:
     return await asyncio.to_thread(_get_conversation_sync, conversation_id)
+
+
+def _save_buttons_sync(conversation_id: int, labels: list[str]) -> list[int]:
+    now = _now()
+    with _connect() as conn:
+        ids = []
+        for label in labels:
+            cur = conn.execute(
+                "INSERT INTO conversation_buttons (conversation_id, label, created_at) VALUES (?,?,?)",
+                (conversation_id, label, now),
+            )
+            ids.append(int(cur.lastrowid))
+        return ids
+
+
+async def save_buttons(conversation_id: int, labels: list[str]) -> list[int]:
+    return await asyncio.to_thread(_save_buttons_sync, conversation_id, labels)
+
+
+def _get_button_sync(button_id: int) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversation_buttons WHERE id = ?", (button_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+async def get_button(button_id: int) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_get_button_sync, button_id)
+
+
+def _set_conversation_expecting_sync(conversation_id: int, expecting: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET expecting = ? WHERE id = ?", (expecting, conversation_id)
+        )
+
+
+async def set_conversation_expecting(conversation_id: int, expecting: str) -> None:
+    await asyncio.to_thread(_set_conversation_expecting_sync, conversation_id, expecting)
 
 
 def _record_agent_turn_sync(

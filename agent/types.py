@@ -25,6 +25,11 @@ class TurnResult:
 
     kind: str  # "reply" | "escalate" | "failed"
     text: str | None = None
+    # Quick answers drawn for this particular message. Never a gate: whatever
+    # is on them, the user can always just type instead.
+    buttons: list[str] = field(default_factory=list)
+    # What the agent is waiting for now: "text", "choice", "file" or "none".
+    expect: str = "text"
     staff_summary: str | None = None
     reason: str | None = None
     tool_calls: list[str] = field(default_factory=list)

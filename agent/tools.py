@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-import ai_decider
+from agent import guards
 from agent.types import TurnContext, TurnResult
 
 
@@ -52,11 +52,47 @@ class ToolRegistry:
         return self._specs.get(name)
 
 
+MAX_BUTTONS = 4
+MAX_BUTTON_LABEL = 40
+EXPECTATIONS = ("text", "choice", "file", "none")
+
+
+def sanitize_buttons(raw: Any) -> list[str]:
+    """Buttons are a convenience, so a malformed one is dropped rather than
+    failing the turn - the text of the message still stands on its own."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ToolError("buttons должен быть списком коротких подписей")
+    labels: list[str] = []
+    for item in raw:
+        label = item.get("label") if isinstance(item, dict) else item
+        if not isinstance(label, str):
+            continue
+        label = " ".join(label.split())[:MAX_BUTTON_LABEL]
+        if label and label not in labels:
+            labels.append(label)
+    return labels[:MAX_BUTTONS]
+
+
 async def _reply(args: dict[str, Any], _ctx: TurnContext) -> TurnResult:
     text = (args.get("text") or "").strip()
     if not text:
         raise ToolError("reply нужен непустой text")
-    if ai_decider.promises_a_handoff(text):
+    offending = guards.self_service_advice(text)
+    if offending:
+        # Recoverable, and worth recovering: the answer may be right apart from
+        # this one sentence, so ask for a rewrite rather than losing the turn.
+        raise ToolError(
+            f"Нельзя советовать юзеру обслуживать аппарат («{offending}») — киоск наш и "
+            "закрытый. Перепиши ответ: что можем сделать мы и что реально может он "
+            "(распечатать заново, сходить к другому аппарату, прислать чек)."
+        )
+    buttons = sanitize_buttons(args.get("buttons"))
+    expect = args.get("expect")
+    if expect not in EXPECTATIONS:
+        expect = "choice" if buttons else "text"
+    if guards.promises_a_handoff(text):
         # The bot may only claim a hand-off when one happens. Rather than
         # arguing with the model about wording, make what it said true.
         return TurnResult(
@@ -65,7 +101,7 @@ async def _reply(args: dict[str, Any], _ctx: TurnContext) -> TurnResult:
             reason="reply_promised_staff",
             staff_summary=f"Агент пообещал юзеру передать обращение сотруднику: «{text}»",
         )
-    return TurnResult(kind="reply", text=text)
+    return TurnResult(kind="reply", text=text, buttons=buttons, expect=expect)
 
 
 async def _escalate(args: dict[str, Any], _ctx: TurnContext) -> TurnResult:
@@ -92,7 +128,25 @@ REPLY = ToolSpec(
             "text": {
                 "type": "string",
                 "description": "Сообщение юзеру на его языке (русский или казахский).",
-            }
+            },
+            "buttons": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "До 4 коротких вариантов ответа под этот конкретный вопрос — то, что "
+                    "юзеру иначе пришлось бы печатать. Не список тем и не меню: варианты "
+                    "должны отвечать именно на твой вопрос. Если ответ свободный "
+                    "(описать проблему, назвать сумму) — не давай кнопок вовсе."
+                ),
+            },
+            "expect": {
+                "type": "string",
+                "enum": list(EXPECTATIONS),
+                "description": (
+                    "Что ты ждёшь дальше: 'choice' — выбор из кнопок, 'text' — свободный "
+                    "ответ, 'file' — фото или PDF (например чек), 'none' — разговор закончен."
+                ),
+            },
         },
         "required": ["text"],
     },
