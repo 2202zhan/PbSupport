@@ -652,3 +652,64 @@ async def test_a_recent_receipt_still_triggers_a_second_look(monkeypatch):
     await triage.on_receipt_received(message, state, bot=None, api=None)
 
     assert rechecked == [True]
+
+
+async def test_receipt_sent_in_reply_to_the_ai_question_is_processed(monkeypatch):
+    # Reported case: the model asked "пришлите чек", the user sent a PDF, and
+    # the bot repeated the question - the in_dialogue handler read message.text,
+    # which is None for a document, so nothing new ever reached the model.
+    import receipt_parser
+
+    async def _extract(bot, message):
+        return "file-1", True, receipt_parser.ReceiptData(
+            amount=35.0, paid_at=datetime(2026, 9, 8, 20, 55), receipt_number="QR1"
+        )
+
+    seen = {}
+
+    async def _cycle(bot, api, state, message, ticket_id, ticket_input):
+        seen["input"] = ticket_input
+
+    async def _get_ticket(_id):
+        return _record(problem_type="not_printed", apparat_name="Аппарат №1")
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
+    monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 21, 11))
+
+    message = _RecordingMessage("")
+    state = _FakeState({"ticket_id": 60, "dialogue_history": ["user: толедим но шыкпады"]})
+    await triage.on_followup_receipt(message, state, bot=None, api=None)
+
+    ticket_input = seen["input"]
+    assert ticket_input.manual_hint_amount == 35.0
+    assert ticket_input.manual_hint_is_precise is True
+    assert ticket_input.receipt_photo_file_id == "file-1"
+    assert any("чек" in line for line in ticket_input.dialogue_history)
+
+
+async def test_unparsable_receipt_in_dialogue_still_reaches_staff(monkeypatch):
+    # A photo can't be read without OCR, but it must still be attached and the
+    # investigation re-run rather than the question repeated.
+    async def _extract(bot, message):
+        return "photo-1", False, None
+
+    seen = {}
+
+    async def _cycle(bot, api, state, message, ticket_id, ticket_input):
+        seen["input"] = ticket_input
+
+    async def _get_ticket(_id):
+        return _record(problem_type="not_printed")
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
+    monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
+
+    message = _RecordingMessage("")
+    state = _FakeState({"ticket_id": 60, "dialogue_history": []})
+    await triage.on_followup_receipt(message, state, bot=None, api=None)
+
+    assert seen["input"].receipt_photo_file_id == "photo-1"
+    assert seen["input"].manual_hint_is_precise is False

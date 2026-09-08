@@ -1100,6 +1100,21 @@ async def _extract_receipt_data(
     return "", False, None
 
 
+async def _refuse_stale_receipt(message: Message, state: FSMContext, ticket_id: int, paid_at) -> None:
+    """The receipt is the ground truth about when this happened, and it can
+    contradict the ticket outright - a payment from three months ago means the
+    wrong file was attached. Say which date we read, so it can be fixed."""
+    await storage.set_ticket_status(ticket_id, "too_old")
+    await message.answer(
+        f"На чеке указано {paid_at:%d.%m.%Y %H:%M} — это больше суток назад, а такие заявки "
+        "мы проверить уже не можем: технические данные за тот период не сохраняются.\n\n"
+        "Если проблема была сегодня — пришлите, пожалуйста, чек именно за неё.",
+        reply_markup=_main_menu_keyboard(),
+    )
+    sessions.forget(str(message.from_user.id))
+    await state.clear()
+
+
 @router.message(TicketFlow.awaiting_receipt_photo, F.photo | F.document)
 async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient) -> None:
     file_id, is_document, parsed = await _extract_receipt_data(bot, message)
@@ -1111,21 +1126,7 @@ async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api
     if data.get("awaiting_post_diagnosis_receipt"):
         ticket_id = data["ticket_id"]
         if parsed is not None and _is_too_old(parsed.paid_at):
-            # The receipt is the ground truth about when this happened, and it
-            # can contradict the ticket outright - someone sending a payment
-            # from three months ago has attached the wrong file. Catch it here
-            # rather than re-running the investigation and handing staff a case
-            # that was never actionable.
-            await storage.set_ticket_status(ticket_id, "too_old")
-            await message.answer(
-                f"На чеке указано {parsed.paid_at:%d.%m.%Y %H:%M} — это больше суток назад, "
-                "а такие заявки мы проверить уже не можем: технические данные за тот период "
-                "не сохраняются.\n\nЕсли проблема была сегодня — пришлите, пожалуйста, чек "
-                "именно за неё.",
-                reply_markup=_main_menu_keyboard(),
-            )
-            sessions.forget(str(message.from_user.id))
-            await state.clear()
+            await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
             return
 
         if parsed is not None:
@@ -1869,6 +1870,52 @@ async def on_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=_main_menu_keyboard(),
     )
     await callback.answer()
+
+
+@router.message(TicketFlow.in_dialogue, F.photo | F.document)
+async def on_followup_receipt(message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient) -> None:
+    """A receipt sent in reply to the AI's own "пришлите чек" question. Without
+    this it fell through to on_followup_message, which reads message.text -
+    None for a document - so the model saw nothing new and asked again."""
+    file_id, is_document, parsed = await _extract_receipt_data(bot, message)
+    if not file_id:
+        await message.answer("Не получилось прочитать файл, пришлите, пожалуйста, ещё раз.")
+        return
+
+    data = await state.get_data()
+    ticket_id = data["ticket_id"]
+    if parsed is not None and _is_too_old(parsed.paid_at):
+        await _refuse_stale_receipt(message, state, ticket_id, parsed.paid_at)
+        return
+
+    await message.answer("Чек получен, проверяю ещё раз... 🔍")
+    ticket_record = await storage.get_ticket(ticket_id)
+    dialogue_history = data.get("dialogue_history", [])
+    dialogue_history.append(
+        f"user: прислал чек на {parsed.amount} ₸ от {parsed.paid_at:%d.%m %H:%M}"
+        if parsed is not None
+        else "user: прислал чек картинкой (сумму и дату распознать не удалось)"
+    )
+    ticket_input = diagnosis.TicketInput(
+        problem_type=ticket_record.problem_type,
+        apparat_name_text=ticket_record.apparat_name or "",
+        telegram_id=ticket_record.telegram_id,
+        username=ticket_record.username,
+        contact=ticket_record.contact,
+        raw_text=ticket_record.raw_text or "",
+        submitted_at=tz.now(),
+        dialogue_history=dialogue_history,
+        manual_hint_amount=parsed.amount if parsed is not None else None,
+        manual_hint_amount_tolerance=1.0,
+        manual_hint_time=parsed.paid_at if parsed is not None else None,
+        manual_hint_time_tolerance_seconds=120,
+        manual_hint_is_precise=parsed is not None,
+        receipt_photo_file_id=file_id,
+        receipt_is_document=is_document,
+    )
+    await state.update_data(dialogue_history=dialogue_history)
+    sessions.touch(ticket_input.telegram_id)
+    await _run_decision_cycle(bot, api, state, message, ticket_id, ticket_input)
 
 
 @router.message(TicketFlow.in_dialogue)
