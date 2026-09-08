@@ -118,13 +118,9 @@ _NO_CODE_REPLY = (
 )
 
 _QUALITY_REPLIES = {
-    # "faded" is answered from the apparat's real toner level instead - see
-    # _faded_print_reply. The others have no live signal to check against.
-    "streaks": (
-        "▬ Полосы и пятна означают, что аппарату нужно обслуживание — это на нас. "
-        "Передам сотрудникам, чтобы посмотрели. Если распечатка испорчена и вы платили "
-        "за неё — нажмите «😕 Не помогло», разберёмся с возвратом."
-    ),
+    # "faded" and "streaks" are answered from the apparat's own paper/toner
+    # reading instead - see _quality_reply. Missing pages are a property of the
+    # document, so there is nothing on the machine to check.
     "missing_pages": (
         "📄 Если в документе были пустые (белые) страницы, иногда они не печатаются — "
         "проверьте, нет ли среди недостающих именно таких, и что в настройках было "
@@ -690,20 +686,29 @@ def _apparats_are_awake() -> bool:
     return _WORKDAY_START_HOUR <= tz.now().hour < _WORKDAY_END_HOUR
 
 
+_ASLEEP_REPLY = (
+    "🌙 Сейчас аппараты выключены — они работают с 8:00 до 19:00, и состояние аппарата "
+    "мне сейчас не видно. Напишите, пожалуйста, в рабочее время: я сразу проверю и отвечу."
+)
+
+
 async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
     """Looks up what the machine reports about paper and toner, so a "закончилась
     бумага" report doesn't reach staff as bare hearsay.
 
-    Returns (verdict, staff_note). The verdict is "confirmed" when something is
-    genuinely low or the apparat is reporting an error, "healthy" when it says
-    everything is in order, and "unknown" when we couldn't ask - at night the
-    kiosks are switched off, and a reading taken then means nothing.
+    Returns (verdict, staff_note):
+    - "asleep"   - outside 08:00-19:00 the kiosks are off, so there is nothing
+                   to read and nothing to tell staff either;
+    - "critical" - something is genuinely low, or the apparat reports an error;
+    - "healthy"  - it says everything is in order;
+    - "unknown"  - we asked and couldn't get an answer during working hours,
+                   which is itself worth a human look.
 
     Exact figures go to staff only; the user gets a plain answer, not a dump of
     our counters.
     """
     if not _apparats_are_awake():
-        return "unknown", f"аппараты выключены (сейчас {tz.now():%H:%M}), показаний нет"
+        return "asleep", f"аппараты выключены (сейчас {tz.now():%H:%M}), показаний нет"
     try:
         apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
         statuses = await api.get_all_printer_statuses()
@@ -733,7 +738,7 @@ async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tupl
     confirmed = bool(error_text) or (pages is not None and pages < _LOW_PAGES) or (
         lowest_toner is not None and lowest_toner < _LOW_TONER
     )
-    return ("confirmed" if confirmed else "healthy"), staff_note
+    return ("critical" if confirmed else "healthy"), staff_note
 
 
 def _sheets_word(n: int) -> str:
@@ -750,6 +755,14 @@ async def _report_device_issue(
     staff the readings instead of a bare "юзер сообщает"."""
     telegram_id = str(callback.from_user.id)
     username = callback.from_user.username
+    if not _apparats_are_awake():
+        # Nothing to read and nothing to report: a reading taken while the
+        # kiosks are off says only that it is night.
+        await callback.message.edit_text(_ASLEEP_REPLY, reply_markup=_main_menu_keyboard())
+        sessions.forget(telegram_id)
+        await state.clear()
+        return
+
     await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
     verdict, staff_note = await _read_supplies(api, apparat_name_text)
 
@@ -759,8 +772,8 @@ async def _report_device_issue(
         # over. Close it here rather than sending someone on a wasted trip -
         # and leave an obvious way back if printing really is failing.
         await callback.message.edit_text(
-            f"Проверил аппарат «{apparat_name_text}» — бумага и тонер на месте, об ошибках "
-            "он не сообщает.\n\nЕсли распечатка всё равно не выходит, выберите «📞 Сообщить "
+            f"Проверил аппарат «{apparat_name_text}» — он не сообщает ни о нехватке бумаги "
+            "или тонера, ни об ошибках.\n\nЕсли распечатка всё равно не выходит, выберите «📞 Сообщить "
             "о проблеме» → «Не печатает документ»: там я проверю ваш заказ по нашим данным.",
             reply_markup=_main_menu_keyboard(),
         )
@@ -788,7 +801,7 @@ async def _report_device_issue(
     )
     # Figures stay on the staff side - the user needs to know we looked and
     # what happens next, not our counter readings.
-    if verdict == "confirmed":
+    if verdict == "critical":
         checked = " Проверил — аппарат действительно сообщает о нехватке расходников."
     else:
         checked = ""
@@ -908,21 +921,6 @@ async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext) -> 
     await callback.answer()
 
 
-async def _read_toner_level(api: PrintBoxAPIClient, apparat_name_text: str) -> int | None:
-    """Lowest cartridge level the apparat reports, or None if we couldn't ask."""
-    try:
-        apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
-        if apparat is None:
-            return None
-        statuses = await api.get_all_printer_statuses()
-    except PrintBoxAPIError:
-        logger.warning("could not read toner for %s", apparat_name_text)
-        return None
-    current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None) or {}
-    levels = [v for v in (current.get("toner") or {}).values() if isinstance(v, (int, float))]
-    return int(min(levels)) if levels else None
-
-
 # Statuses that mean a human already has this ticket in front of them - only
 # then may a reply say "сотрудники уже смотрят" without it being a lie.
 _WITH_STAFF_STATUSES = ("escalated", "awaiting_receipt")
@@ -933,58 +931,67 @@ async def _apparat_state_note(
 ) -> str | None:
     """A plain-language line about the machine for the follow-up model, so it
     answers "почему бледно печатает?" with what we actually see instead of
-    telling the user it can't check anything. No figures - the model talks to
+    telling the user it can't check anything. No figures - the model writes to
     the user, and our counters are staff-side."""
     if ticket is None or not ticket.apparat_name:
         return None
     if ticket.problem_type not in ("print_quality", "device_issue"):
         return None
-    if not _apparats_are_awake():
-        return "аппараты сейчас выключены (работают с 8:00 до 19:00), свежих показаний нет"
-    level = await _read_toner_level(api, ticket.apparat_name)
-    if level is None:
-        return None
-    if level < _LOW_TONER:
-        return "картридж на этом аппарате на исходе, его нужно заменить — это наша задача"
-    return "картриджа на этом аппарате достаточно, об ошибках аппарат не сообщает"
+    verdict, _ = await _read_supplies(api, ticket.apparat_name)
+    return {
+        "asleep": "аппараты сейчас выключены (работают с 8:00 до 19:00), свежих показаний нет",
+        "critical": "на этом аппарате заканчиваются бумага или тонер — заменить их наша задача",
+        "healthy": "бумага и тонер на этом аппарате в порядке, об ошибках аппарат не сообщает",
+    }.get(verdict)
 
 
-async def _faded_print_reply(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
-    """Answers a "faded print" complaint from the apparat's real cartridge level.
+# What the user complained about, in words that fit inside a sentence.
+_QUALITY_CHECKED_ISSUES = {
+    "faded": ("🌫", "бледную печать", "печатает бледно"),
+    "streaks": ("▬", "полосы и пятна на распечатке", "идут полосы"),
+}
 
-    The user can't act on toner either way - it's ours to refill - so the reply
-    only ever states what we found and what happens next. Every branch hands the
-    complaint to staff: a faded page is a machine that needs a look, whether or
-    not the cartridge is what's low. Returns (reply, staff_summary)."""
-    level = await _read_toner_level(api, apparat_name_text)
+_QUALITY_REFUND_HINT = (
+    "Если распечатка испорчена и вы за неё платили — нажмите «😕 Не помогло», "
+    "разберёмся с возвратом."
+)
 
-    if level is not None and level < _LOW_TONER:
+
+def _quality_reply(
+    key: str, verdict: str, apparat_name_text: str, staff_note: str
+) -> tuple[str, str | None]:
+    """Answers a print-quality complaint from what the machine reports about its
+    own paper and toner.
+
+    Returns (reply, staff_summary), where staff_summary is None when there is
+    nothing for a human to do: we watch the levels ourselves, so a ticket about
+    a kiosk that just told us it is full is noise, and the user still has
+    «😕 Не помогло» if the reprint fails too.
+    """
+    icon, complaint, symptom = _QUALITY_CHECKED_ISSUES[key]
+    if verdict == "critical":
         return (
-            "🌫 Проверил аппарат — картридж действительно на исходе. Это на нашей стороне, "
-            "передаю сотрудникам, чтобы заменили. Пока можно распечатать на другом нашем "
-            "аппарате. Если распечатка испорчена и вы за неё платили — нажмите "
-            "«😕 Не помогло», разберёмся с возвратом."
+            f"{icon} Проверил аппарат — расходники на исходе, поэтому он и {symptom}. Это на "
+            "нашей стороне, передаю сотрудникам, заменят. Пока можно распечатать на другом "
+            f"нашем аппарате. {_QUALITY_REFUND_HINT}"
         ), (
-            f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}», картридж на "
-            f"исходе ({level}%) — нужно заменить."
+            f"{icon} Юзер жалуется на {complaint} на «{apparat_name_text}». "
+            f"Показания аппарата: {staff_note} — нужно обслужить."
         )
-    if level is not None:
+    if verdict == "healthy":
         return (
-            "🌫 Проверил аппарат — с картриджем всё в порядке, тонера достаточно. Попробуйте, "
-            "пожалуйста, распечатать ещё раз — или на другом нашем аппарате, если он рядом. "
-            "Замечание я принял: сотрудники проверят этот аппарат. Если распечатка испорчена "
-            "и вы за неё платили — нажмите «😕 Не помогло», разберёмся с возвратом."
-        ), (
-            f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}». Картридж по "
-            f"мониторингу в норме ({level}%) — стоит посмотреть аппарат вживую."
-        )
+            f"{icon} Проверил аппарат — он не сообщает ни о нехватке бумаги или тонера, ни об "
+            "ошибках. "
+            "Попробуйте, пожалуйста, распечатать ещё раз — или на другом нашем аппарате, "
+            f"если он рядом. {_QUALITY_REFUND_HINT}"
+        ), None
     return (
-        "🌫 Замечание принял — сотрудники проверят этот аппарат. Попробуйте, пожалуйста, "
-        "распечатать ещё раз или воспользоваться другим нашим аппаратом. Если распечатка "
-        "испорчена и вы за неё платили — нажмите «😕 Не помогло», разберёмся с возвратом."
+        f"{icon} Замечание принял — передал сотрудникам, они посмотрят этот аппарат. "
+        "Попробуйте пока распечатать ещё раз или воспользоваться другим нашим аппаратом. "
+        f"{_QUALITY_REFUND_HINT}"
     ), (
-        f"🌫 Юзер жалуется на бледную печать на «{apparat_name_text}». Показаний "
-        "картриджа сейчас нет — нужно посмотреть аппарат вживую."
+        f"{icon} Юзер жалуется на {complaint} на «{apparat_name_text}». "
+        f"Показаний аппарата нет ({staff_note}) — нужно посмотреть вживую."
     )
 
 
@@ -1010,15 +1017,18 @@ async def on_quality_chosen(
 
     label = dict(_QUALITY_ISSUE_OPTIONS)[key]
     staff_summary = None
-    if key == "faded":
+    if key in _QUALITY_CHECKED_ISSUES:
+        if not _apparats_are_awake():
+            # Don't promise a check we can't run: the kiosks are off, and a
+            # reading taken now would only say that it is night.
+            await callback.message.edit_text(_ASLEEP_REPLY, reply_markup=_main_menu_keyboard())
+            sessions.forget(telegram_id)
+            await state.clear()
+            await callback.answer()
+            return
         await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
-        reply, staff_summary = await _faded_print_reply(api, apparat_name_text)
-    elif key == "streaks":
-        reply = _QUALITY_REPLIES[key]
-        staff_summary = (
-            f"▬ Юзер жалуется на полосы/пятна на распечатке на «{apparat_name_text}» — "
-            "аппарату нужно обслуживание."
-        )
+        verdict, staff_note = await _read_supplies(api, apparat_name_text)
+        reply, staff_summary = _quality_reply(key, verdict, apparat_name_text, staff_note)
     else:
         reply = _QUALITY_REPLIES[key]
 

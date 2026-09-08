@@ -426,98 +426,47 @@ async def test_paid_complaint_still_asks_for_the_receipt(monkeypatch):
     assert any("чек" in t.lower() for t in message.answered_with)
 
 
-class _TonerApi:
-    def __init__(self, toner=None, raise_=False):
-        self.toner, self.raise_ = toner, raise_
-
-    async def get_apparats(self):
-        if self.raise_:
-            from api_client import PrintBoxAPIError
-            raise PrintBoxAPIError("down")
-        return [_FakeApparat(id=1, name_apparat="Аппарат №1")]
-
-    async def get_all_printer_statuses(self):
-        if self.raise_:
-            from api_client import PrintBoxAPIError
-            raise PrintBoxAPIError("down")
-        return [{"apparat_id": 1, "is_online": True, "error_text": None, "toner": self.toner}]
+def _quality(key, verdict, staff_note="тонер 4%"):
+    return triage._quality_reply(key, verdict, "Аппарат №1", staff_note)
 
 
-async def test_low_toner_reaches_staff_with_the_figure():
-    reply, staff_summary = await triage._faded_print_reply(_TonerApi({"black": 4}), "Аппарат №1")
+def test_low_supplies_reach_staff_with_the_figures():
+    reply, staff_summary = _quality("faded", "critical")
     assert "4%" in staff_summary
     assert "исходе" in reply
 
 
-async def test_healthy_toner_still_reaches_staff():
-    # The machine printing faded on a full cartridge is exactly the case a
-    # human has to look at - "тонера достаточно" is not an answer on its own.
-    reply, staff_summary = await triage._faded_print_reply(_TonerApi({"black": 80}), "Аппарат №1")
-    assert "80%" in staff_summary
-    assert "в порядке" in reply
+def test_a_healthy_machine_is_not_reported_to_staff():
+    # "по всем пустякам не надо создавать заявку - мы и так знаем уровни и
+    # всегда следим". A kiosk that just told us nothing is low is not news.
+    reply, staff_summary = _quality("faded", "healthy")
+    assert staff_summary is None
     assert "ещё раз" in reply
+    assert "Не помогло" in reply  # the way back if the reprint fails too
 
 
-async def test_unreadable_toner_neither_guesses_nor_confesses():
-    # The user gets a real next step, not a report about our own blind spots.
-    reply, staff_summary = await triage._faded_print_reply(_TonerApi(raise_=True), "Аппарат №1")
+def test_an_unreadable_machine_is_worth_a_human_look():
+    reply, staff_summary = _quality("streaks", "unknown", staff_note="показаний от аппарата нет")
     assert staff_summary
     assert "не могу" not in reply.lower()
-    assert "замечание принял" in reply.lower()
 
 
-async def test_no_branch_leaks_our_counters_to_the_user():
-    # Toner percentages are staff-side: the user is told what it means, not
-    # what our monitoring reads.
-    for api in [_TonerApi({"black": 4}), _TonerApi({"black": 80}), _TonerApi(raise_=True)]:
-        reply, _ = await triage._faded_print_reply(api, "Аппарат №1")
-        assert "%" not in reply, reply
+def test_no_quality_answer_leaks_our_counters():
+    for key in ("faded", "streaks"):
+        for verdict in ("critical", "healthy", "unknown"):
+            reply, _ = _quality(key, verdict)
+            assert "%" not in reply, (key, verdict, reply)
 
 
-async def test_every_faded_print_complaint_reaches_a_human():
-    # The recurring bug was the opposite one: a scripted reply claiming
-    # "передал сотрудникам" while _send_scripted_reply notified nobody. Now
-    # every branch really does escalate, so every branch may say so.
-    for api in [_TonerApi({"black": 4}), _TonerApi({"black": 80}), _TonerApi(raise_=True)]:
-        _, staff_summary = await triage._faded_print_reply(api, "Аппарат №1")
-        assert staff_summary
+def test_only_the_answers_that_escalate_claim_a_handoff():
+    # The recurring bug: a scripted reply saying "передаю сотрудникам" while
+    # nobody is told. The claim and the escalation now move together.
+    import ai_decider
 
-
-async def test_user_message_goes_to_staff_while_live_chat_is_open(monkeypatch):
-    # Without this the user answers a human and the assistant replies instead -
-    # which is what happened when the relay was one message wide.
-    relayed = []
-
-    async def _relay(bot, ticket, message):
-        relayed.append(message.text)
-
-    async def _find(_tid):
-        return _record(live_chat=1, forum_topic_id=42)
-
-    monkeypatch.setattr(triage.notify, "relay_user_message", _relay)
-    monkeypatch.setattr(triage.storage, "find_live_chat_ticket", _find)
-
-    message = _RecordingMessage("а когда почините?")
-    await triage.on_live_chat_message(message, bot=None)
-
-    assert relayed == ["а когда почините?"]
-
-
-async def test_without_live_chat_the_message_falls_through_to_the_assistant(monkeypatch):
-    from aiogram.dispatcher.event.bases import SkipHandler
-
-    async def _find(_tid):
-        return None
-
-    monkeypatch.setattr(triage.storage, "find_live_chat_ticket", _find)
-
-    message = _RecordingMessage("сколько стоит цветная печать?")
-    try:
-        await triage.on_live_chat_message(message, bot=None)
-    except SkipHandler:
-        pass
-    else:
-        raise AssertionError("should have skipped to the next handler")
+    for key in ("faded", "streaks"):
+        for verdict in ("critical", "healthy", "unknown"):
+            reply, staff_summary = _quality(key, verdict)
+            assert ai_decider.promises_a_handoff(reply) == (staff_summary is not None), (key, verdict)
 
 
 class _SuppliesApi:
@@ -529,7 +478,7 @@ class _SuppliesApi:
             from api_client import PrintBoxAPIError
             raise PrintBoxAPIError("down")
         from api_client import Apparat
-        return [Apparat(id=1, name_apparat="Аппарат №1", address="Главный",
+        return [Apparat(id=1, name_apparat="Аппарат №1", address="Главный корпус",
                         status="online", pages_left=self.pages)]
 
     async def get_all_printer_statuses(self):
@@ -539,7 +488,6 @@ class _SuppliesApi:
         return [{"apparat_id": 1, "toner": self.toner, "error_text": self.error}]
 
 
-
 def _daytime(monkeypatch):
     monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 14, 0))
 
@@ -547,7 +495,7 @@ def _daytime(monkeypatch):
 async def test_low_paper_corroborates_the_report(monkeypatch):
     _daytime(monkeypatch)
     verdict, staff = await triage._read_supplies(_SuppliesApi(pages=3, toner={"black": 60}), "Аппарат №1")
-    assert verdict == "confirmed"
+    assert verdict == "critical"
     assert "3 листа" in staff
 
 
@@ -556,7 +504,7 @@ async def test_device_error_counts_as_confirmation(monkeypatch):
     verdict, staff = await triage._read_supplies(
         _SuppliesApi(pages=400, toner={"black": 60}, error="Замялась бумага"), "Аппарат №1"
     )
-    assert verdict == "confirmed"
+    assert verdict == "critical"
     assert "Замялась бумага" in staff
 
 
@@ -576,7 +524,7 @@ async def test_readings_taken_at_night_mean_nothing(monkeypatch):
     # machine is off, not that it is broken.
     monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 2, 0))
     verdict, staff = await triage._read_supplies(_SuppliesApi(pages=3), "Аппарат №1")
-    assert verdict == "unknown"
+    assert verdict == "asleep"
     assert "выключены" in staff
 
 
@@ -784,23 +732,23 @@ async def test_a_stale_receipt_after_not_helped_is_still_refused(monkeypatch):
 
 
 async def test_apparat_state_note_carries_no_figures(monkeypatch):
-    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: True)
+    _daytime(monkeypatch)
     ticket = _record(problem_type="print_quality", apparat_name="Аппарат №1")
-    note = await triage._apparat_state_note(_TonerApi({"black": 80}), ticket)
+    note = await triage._apparat_state_note(_SuppliesApi(pages=283, toner={"black": 80}), ticket)
     assert note and "%" not in note
 
 
 async def test_apparat_state_note_is_silent_when_the_kiosks_are_off(monkeypatch):
-    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: False)
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 2, 0))
     ticket = _record(problem_type="print_quality", apparat_name="Аппарат №1")
-    note = await triage._apparat_state_note(_TonerApi({"black": 80}), ticket)
+    note = await triage._apparat_state_note(_SuppliesApi(pages=283), ticket)
     assert note and "выключены" in note
 
 
 async def test_apparat_state_note_skipped_for_a_money_ticket(monkeypatch):
-    monkeypatch.setattr(triage, "_apparats_are_awake", lambda: True)
+    _daytime(monkeypatch)
     ticket = _record(problem_type="not_printed", apparat_name="Аппарат №1")
-    assert await triage._apparat_state_note(_TonerApi({"black": 80}), ticket) is None
+    assert await triage._apparat_state_note(_SuppliesApi(pages=283), ticket) is None
 
 
 class _FakeCallback:
@@ -820,59 +768,79 @@ class _FakeCallback:
         self.answered = True
 
 
-async def test_a_faded_print_complaint_reaches_staff_and_says_so(monkeypatch):
-    # The screenshot that started this: the user got "не могу проверить" and
-    # nobody was told. Now the machine is read, the user gets a real next step,
-    # and a card really does go out.
-    created, escalated = [], []
-
+def _scripted(monkeypatch, escalated):
     async def _create_ticket(**kwargs):
-        created.append(kwargs)
+        escalated.setdefault("created", []).append(kwargs)
         return 61
 
     async def _record_decision(*_args):
         return None
 
     async def _escalate(bot, ticket_id, evidence, decision, review=None):
-        escalated.append(decision)
+        escalated.setdefault("cards", []).append(decision)
 
     monkeypatch.setattr(triage.storage, "create_ticket", _create_ticket)
     monkeypatch.setattr(triage.storage, "record_decision", _record_decision)
     monkeypatch.setattr(triage, "_escalate", _escalate)
+
+
+async def test_a_healthy_machine_closes_the_quality_complaint_itself(monkeypatch):
+    # "по всем пустякам не надо создавать заявку - мы и так знаем уровни".
+    _daytime(monkeypatch)
+    seen = {}
+    _scripted(monkeypatch, seen)
 
     callback = _FakeCallback("quality:faded")
     await triage.on_quality_chosen(
-        callback, _FakeState({"apparat_name_text": "главный корпус"}), None, _TonerApi({"black": 80})
+        callback, _FakeState({"apparat_name_text": "главный корпус"}), None,
+        _SuppliesApi(pages=283, toner={"black": 80}),
     )
 
-    assert len(escalated) == 1
+    assert seen.get("cards") is None
     reply = callback.message.answered_with[0]
-    assert "%" not in reply
-    assert "ещё раз" in reply
-    assert created[0]["problem_type"] == "print_quality"
+    assert "%" not in reply and "ещё раз" in reply
 
 
-async def test_streaks_are_not_answered_with_a_promise_nobody_keeps(monkeypatch):
-    # The scripted answer says "передам сотрудникам" - so it has to.
-    escalated = []
-
-    async def _create_ticket(**kwargs):
-        return 62
-
-    async def _record_decision(*_args):
-        return None
-
-    async def _escalate(bot, ticket_id, evidence, decision, review=None):
-        escalated.append(decision)
-
-    monkeypatch.setattr(triage.storage, "create_ticket", _create_ticket)
-    monkeypatch.setattr(triage.storage, "record_decision", _record_decision)
-    monkeypatch.setattr(triage, "_escalate", _escalate)
+async def test_a_low_machine_reaches_staff(monkeypatch):
+    _daytime(monkeypatch)
+    seen = {}
+    _scripted(monkeypatch, seen)
 
     callback = _FakeCallback("quality:streaks")
     await triage.on_quality_chosen(
-        callback, _FakeState({"apparat_name_text": "Аппарат №1"}), None, _TonerApi({"black": 80})
+        callback, _FakeState({"apparat_name_text": "Аппарат №1"}), None,
+        _SuppliesApi(pages=3, toner={"black": 4}),
     )
 
-    assert len(escalated) == 1
-    assert "Передам сотрудникам" in callback.message.answered_with[0]
+    assert len(seen["cards"]) == 1
+    assert seen["created"][0]["problem_type"] == "print_quality"
+
+
+async def test_at_night_the_quality_complaint_is_not_a_ticket(monkeypatch):
+    # Nothing to read while the kiosks are off - say so and invite them back,
+    # instead of filing a report nobody can act on.
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 23, 58))
+    seen = {}
+    _scripted(monkeypatch, seen)
+
+    callback = _FakeCallback("quality:faded")
+    await triage.on_quality_chosen(
+        callback, _FakeState({"apparat_name_text": "Аппарат №4"}), None, _SuppliesApi(pages=283)
+    )
+
+    assert seen == {}
+    assert any("8:00" in t for t in callback.message.edited)
+
+
+async def test_at_night_a_supplies_report_is_not_a_ticket(monkeypatch):
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 23, 58))
+    seen = {}
+    _scripted(monkeypatch, seen)
+
+    callback = _FakeCallback("problem:device_issue")
+    await triage._report_device_issue(
+        None, _SuppliesApi(pages=283), callback, _FakeState({}), "Аппарат №4"
+    )
+
+    assert seen == {}
+    assert any("8:00" in t for t in callback.message.edited)
