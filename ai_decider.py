@@ -220,6 +220,15 @@ _TOOLS = [
                         "type": "string",
                         "description": "Сводка по делу для сотрудника поддержки.",
                     },
+                    "message_for_user": {
+                        "type": "string",
+                        "description": (
+                            "Что сказать юзеру, пока он ждёт сотрудника - на его языке. Если "
+                            "есть конкретный факт или шаг (проверить лоток выдачи, сходить к "
+                            "другому аппарату) - скажи его здесь, а не отделывайся общими "
+                            "словами. Не обещай возврат. Необязательное поле."
+                        ),
+                    },
                 },
                 "required": ["reason", "summary_for_staff"],
             },
@@ -312,7 +321,12 @@ async def decide(evidence: Evidence) -> Decision:
         summary = args.get("summary_for_staff")
         if not reason or not summary:
             return _FAILSAFE
-        return Decision(action="escalate", reason=reason, staff_summary=summary)
+        return Decision(
+            action="escalate",
+            reason=reason,
+            staff_summary=summary,
+            user_message=args.get("message_for_user") or None,
+        )
 
     logger.warning("OpenAI called unknown tool: %s", name)
     return _FAILSAFE

@@ -1448,7 +1448,12 @@ async def _run_decision_cycle(
             sessions.forget(ticket_input.telegram_id)
             await state.clear()
     else:
-        await message.answer(_escalate_user_message(ticket_id), reply_markup=_main_menu_keyboard())
+        # Prefer whatever concrete thing the AI found (a confirmed print, a
+        # working apparat nearby) over the generic "нужен человек" line.
+        text = decision.user_message or _escalate_user_message(ticket_id)
+        if decision.user_message:
+            text = f"🟡 Заявка #{ticket_id}: {decision.user_message}\n\nПередал сотруднику — отвечу здесь."
+        await message.answer(text, reply_markup=_main_menu_keyboard())
         await _escalate(bot, api, message, ticket_id, evidence, decision)
         sessions.forget(ticket_input.telegram_id)
         await state.clear()
