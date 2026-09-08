@@ -58,9 +58,7 @@ _PROBLEM_LABELS = {
     "other": "6️⃣ Другая проблема",
 }
 
-_DESCRIPTION_PROMPTS = {
-    "other": "Опишите своими словами, что случилось — я разберусь.",
-}
+_DESCRIBE_PROMPT = "Опишите своими словами, что случилось — я разберусь."
 
 # Structured intake for the technical categories - buttons cover the common answers,
 # with a "свой ответ" escape hatch for everything else, so free text is the
@@ -602,7 +600,7 @@ async def on_problem_chosen(callback: CallbackQuery, state: FSMContext, bot: Bot
         # category context, and can reclassify it if it sounds payment/print related.
         await _update_intake(state, is_top_level_other=True)
         await state.set_state(TicketFlow.describing)
-        await callback.message.edit_text(_DESCRIPTION_PROMPTS[problem_type], reply_markup=_cancel_keyboard())
+        await callback.message.edit_text(_DESCRIBE_PROMPT, reply_markup=_cancel_keyboard())
     sessions.touch(str(callback.from_user.id))
     await callback.answer()
 
@@ -780,7 +778,7 @@ async def _report_device_issue(
         payment_expected=False,
     )
     await _escalate(
-        bot, api, callback.message, ticket_id, None,
+        bot, ticket_id, None,
         Decision(
             action="escalate",
             reason="device_issue_reported",
@@ -883,7 +881,7 @@ async def on_payment_error_type_chosen(callback: CallbackQuery, state: FSMContex
 
 
 @router.callback_query(F.data.startswith("uploadissue:"), TicketFlow.intake_qa)
-async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext, bot: Bot, api: PrintBoxAPIClient) -> None:
+async def on_upload_issue_chosen(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
     data = await state.get_data()
     apparat_name_text = data.get("apparat_name_text") or ""
@@ -982,7 +980,7 @@ async def on_quality_chosen(
     )
     if tell_staff:
         await _escalate(
-            bot, api, callback.message, ticket_id, None,
+            bot, ticket_id, None,
             Decision(
                 action="escalate",
                 reason="low_toner_reported",
@@ -1046,7 +1044,7 @@ async def on_receipt_photo_requested(callback: CallbackQuery, state: FSMContext)
 
 
 @router.callback_query(F.data == "receipt:skip", TicketFlow.intake_qa)
-async def on_receipt_skipped(callback: CallbackQuery, state: FSMContext) -> None:
+async def on_receipt_skipped(callback: CallbackQuery) -> None:
     await callback.message.edit_text("На какую сумму примерно вы платили?", reply_markup=_amount_keyboard())
     sessions.touch(str(callback.from_user.id))
     await callback.answer()
@@ -1100,10 +1098,6 @@ async def _extract_receipt_data(
     if message.photo:
         return message.photo[-1].file_id, False, None
     return "", False, None
-
-
-async def _forward_receipt_to_staff(bot: Bot, ticket_id: int, file_id: str, is_document: bool) -> None:
-    await notify.forward_receipt(bot, ticket_id, file_id, is_document)
 
 
 @router.message(TicketFlow.awaiting_receipt_photo, F.photo | F.document)
@@ -1164,12 +1158,12 @@ async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api
             "Чек получен, спасибо! Передаю сотруднику для проверки.", reply_markup=_main_menu_keyboard()
         )
         await _escalate(
-            bot, api, message, ticket_id, None,
+            bot, ticket_id, None,
             Decision(action="escalate", reason="no_matching_order_with_receipt_followup",
                      staff_summary=f"Заявка #{ticket_id}: не нашли заказ юзера в системе, юзер "
                      "прислал чек после запроса - нужна ручная проверка."),
         )
-        await _forward_receipt_to_staff(bot, ticket_id, file_id, is_document)
+        await notify.forward_receipt(bot, ticket_id, file_id, is_document)
         sessions.forget(str(message.from_user.id))
         await state.clear()
         return
@@ -1482,7 +1476,7 @@ async def _run_decision_cycle(
         evidence = await diagnosis.gather_evidence(api, ticket_input)
     except PrintBoxAPIError:
         logger.exception("evidence gathering failed for ticket %s", ticket_id)
-        await _escalate(bot, api, message, ticket_id, None, Decision(
+        await _escalate(bot, ticket_id, None, Decision(
             action="escalate",
             reason="diagnosis_failed",
             staff_summary="Не удалось собрать диагностику (ошибка API) - нужна ручная проверка.",
@@ -1531,7 +1525,7 @@ async def _run_decision_cycle(
         await message.answer(
             _refund_pending_message(ticket_id), reply_markup=_main_menu_keyboard()
         )
-        await _escalate(bot, api, message, ticket_id, evidence, decision, review)
+        await _escalate(bot, ticket_id, evidence, decision, review)
         sessions.forget(ticket_input.telegram_id)
         await state.clear()
     elif decision.action in ("give_advice", "ask_clarifying_question"):
@@ -1548,7 +1542,7 @@ async def _run_decision_cycle(
         sessions.touch(ticket_input.telegram_id)
         if rounds >= _MAX_AI_ROUNDS:
             await _escalate(
-                bot, api, message, ticket_id, evidence,
+                bot, ticket_id, evidence,
                 Decision(action="escalate", reason="ai_rounds_exhausted",
                          staff_summary="ИИ несколько раз советовал/уточнял, но вопрос не "
                          "закрылся, нужен человек."),
@@ -1562,7 +1556,7 @@ async def _run_decision_cycle(
         if decision.user_message:
             text = f"🟡 Заявка #{ticket_id}: {decision.user_message}\n\nПередал сотруднику — отвечу здесь."
         await message.answer(text, reply_markup=_main_menu_keyboard())
-        await _escalate(bot, api, message, ticket_id, evidence, decision)
+        await _escalate(bot, ticket_id, evidence, decision)
         sessions.forget(ticket_input.telegram_id)
         await state.clear()
 
@@ -1601,7 +1595,7 @@ async def _handle_no_matching_order(
         # Passing `evidence` (not None) so notify.send_escalation forwards the
         # receipt to staff in the right format (photo vs PDF document).
         await _escalate(
-            bot, api, message, ticket_id, evidence,
+            bot, ticket_id, evidence,
             Decision(action="escalate", reason="no_matching_order_with_receipt",
                      staff_summary=f"Заявка #{ticket_id}: не нашли заказ юзера в системе; "
                      f"{'файла от него тоже не нашли; ' if has_document is False else ''}"
@@ -1652,8 +1646,6 @@ def _escalate_user_message(ticket_id: int) -> str:
 
 async def _escalate(
     bot: Bot,
-    api: PrintBoxAPIClient,
-    message: Message,
     ticket_id: int,
     evidence,
     decision: Decision,
@@ -1672,7 +1664,7 @@ async def _escalate(
 
 
 @router.callback_query(F.data.startswith("feedback:"))
-async def on_feedback(callback: CallbackQuery, state: FSMContext, bot: Bot, api: PrintBoxAPIClient) -> None:
+async def on_feedback(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     _, outcome, ticket_id_str = callback.data.split(":")
     ticket_id = int(ticket_id_str)
     telegram_id = str(callback.from_user.id)
@@ -1703,7 +1695,7 @@ async def on_feedback(callback: CallbackQuery, state: FSMContext, bot: Bot, api:
 
 @router.message(TicketFlow.awaiting_nothelped_detail)
 async def on_nothelped_detail_provided(
-    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+    message: Message, state: FSMContext, bot: Bot
 ) -> None:
     if not message.text:
         await message.answer("Пожалуйста, напишите текстом, что именно не так.")
@@ -1748,7 +1740,7 @@ async def on_nothelped_detail_provided(
         # The complaint is about something that happens before paying (QR never
         # appeared, bank refused, file never uploaded) - there is no receipt to
         # ask for, and asking anyway reads as not having listened.
-        await _proceed_after_escalation_receipt(message, state, bot, api, telegram_id)
+        await _proceed_after_escalation_receipt(message, state, bot, telegram_id)
         return
 
     await state.set_state(TicketFlow.awaiting_escalation_receipt)
@@ -1767,21 +1759,21 @@ async def on_escalation_receipt_photo_requested(callback: CallbackQuery) -> None
 
 @router.message(TicketFlow.awaiting_escalation_receipt, F.photo | F.document)
 async def on_escalation_receipt_provided(
-    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+    message: Message, state: FSMContext, bot: Bot
 ) -> None:
     file_id, is_document, _ = await _extract_receipt_data(bot, message)
     if file_id:
         await state.update_data(
             pending_escalation_receipt_file_id=file_id, pending_escalation_receipt_is_document=is_document
         )
-    await _proceed_after_escalation_receipt(message, state, bot, api, str(message.from_user.id))
+    await _proceed_after_escalation_receipt(message, state, bot, str(message.from_user.id))
 
 
 @router.callback_query(F.data == "escreceipt:skip", TicketFlow.awaiting_escalation_receipt)
 async def on_escalation_receipt_skipped(
-    callback: CallbackQuery, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+    callback: CallbackQuery, state: FSMContext, bot: Bot
 ) -> None:
-    await _proceed_after_escalation_receipt(callback.message, state, bot, api, str(callback.from_user.id))
+    await _proceed_after_escalation_receipt(callback.message, state, bot, str(callback.from_user.id))
     await callback.answer()
 
 
@@ -1792,7 +1784,7 @@ async def on_escalation_receipt_expected_but_text_sent(message: Message) -> None
 
 
 async def _proceed_after_escalation_receipt(
-    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient, telegram_id: str
+    message: Message, state: FSMContext, bot: Bot, telegram_id: str
 ) -> None:
     data = await state.get_data()
     ticket_id = data["pending_escalation_ticket_id"]
@@ -1803,12 +1795,12 @@ async def _proceed_after_escalation_receipt(
     if ticket_record is not None and ticket_record.contact:
         # Already have a way to reach them (e.g. shared earlier) - no need to ask again.
         await _escalate(
-            bot, api, message, ticket_id, None,
+            bot, ticket_id, None,
             Decision(action="escalate", reason=data["pending_escalation_reason"],
                      staff_summary=data["pending_escalation_summary"]),
         )
         if receipt_file_id:
-            await _forward_receipt_to_staff(bot, ticket_id, receipt_file_id, receipt_is_document)
+            await notify.forward_receipt(bot, ticket_id, receipt_file_id, receipt_is_document)
         sessions.forget(telegram_id)
         await state.clear()
         await message.answer("Если что-то ещё понадобится — вот меню:", reply_markup=_main_menu_keyboard())
@@ -1825,7 +1817,7 @@ async def _proceed_after_escalation_receipt(
 
 @router.message(TicketFlow.awaiting_phone_for_escalation)
 async def on_phone_for_escalation_provided(
-    message: Message, state: FSMContext, bot: Bot, api: PrintBoxAPIClient
+    message: Message, state: FSMContext, bot: Bot
 ) -> None:
     data = await state.get_data()
     ticket_id = data["pending_escalation_ticket_id"]
@@ -1847,7 +1839,7 @@ async def on_phone_for_escalation_provided(
     await message.answer("Спасибо! Передаю сотруднику.", reply_markup=ReplyKeyboardRemove())
 
     await _escalate(
-        bot, api, message, ticket_id, None,
+        bot, ticket_id, None,
         Decision(
             action="escalate",
             reason=data["pending_escalation_reason"],
@@ -1856,7 +1848,7 @@ async def on_phone_for_escalation_provided(
     )
     receipt_file_id = data.get("pending_escalation_receipt_file_id")
     if receipt_file_id:
-        await _forward_receipt_to_staff(
+        await notify.forward_receipt(
             bot, ticket_id, receipt_file_id, data.get("pending_escalation_receipt_is_document", False)
         )
     sessions.forget(telegram_id)

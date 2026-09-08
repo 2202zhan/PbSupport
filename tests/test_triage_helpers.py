@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import storage
 import triage
-from guard_rules import Decision
 
 
 def test_custom_when_indicates_old_for_explicit_day_counts():
@@ -315,7 +314,7 @@ async def test_description_handles_voice_instead_of_text():
 
 async def test_nothelped_detail_handles_voice_instead_of_text():
     message = _FakeMessage(None)
-    await triage.on_nothelped_detail_provided(message, state=None, bot=None, api=None)
+    await triage.on_nothelped_detail_provided(message, state=None, bot=None)
     assert message.answered_with == ["Пожалуйста, напишите текстом, что именно не так."]
 
 
@@ -401,14 +400,14 @@ async def test_pre_payment_complaint_skips_the_receipt_question(monkeypatch):
     _escalating_followup(monkeypatch, _record(payment_expected=0))
     reached_phone = []
 
-    async def _proceed(message, state, bot, api, telegram_id):
+    async def _proceed(message, state, bot, telegram_id):
         reached_phone.append(True)
 
     monkeypatch.setattr(triage, "_proceed_after_escalation_receipt", _proceed)
 
     message = _RecordingMessage("оплата кюар ыстемид")
     await triage.on_nothelped_detail_provided(
-        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None
     )
 
     assert reached_phone == [True]
@@ -420,7 +419,7 @@ async def test_paid_complaint_still_asks_for_the_receipt(monkeypatch):
 
     message = _RecordingMessage("деньги списались, ничего не вышло")
     await triage.on_nothelped_detail_provided(
-        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None, None
+        message, _FakeState({"ticket_id": 1, "pending_feedback_original_reply": "…"}), None
     )
 
     assert any("чек" in t.lower() for t in message.answered_with)

@@ -1,4 +1,3 @@
-import guard_rules
 import tz
 from api_client import Apparat, Transaction
 from diagnosis import Evidence, TicketInput

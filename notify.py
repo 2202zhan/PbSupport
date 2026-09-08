@@ -77,13 +77,6 @@ _REJECTED_TEMPLATE = (
 )
 
 
-def _closing_message(ticket) -> str:
-    """Money wording only where money was ever on the table."""
-    if not ticket.payment_expected:
-        return _CLOSED_NEUTRAL_TEMPLATE.format(ticket_id=ticket.id)
-    template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
-    return template.format(ticket_id=ticket.id)
-
 _LIVE_CHAT_OPENED_USER = (
     "💬 С вами на связи сотрудник поддержки. Пишите прямо сюда — он всё видит и ответит."
 )
@@ -94,6 +87,14 @@ _LIVE_CHAT_OPENED_STAFF = (
 )
 
 _LIVE_CHAT_CLOSED_USER = "💬 Диалог с сотрудником завершён."
+
+
+def _closing_message(ticket) -> str:
+    """Money wording only where money was ever on the table."""
+    if not ticket.payment_expected:
+        return _CLOSED_NEUTRAL_TEMPLATE.format(ticket_id=ticket.id)
+    template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
+    return template.format(ticket_id=ticket.id)
 
 
 def _escalation_keyboard(
@@ -178,8 +179,8 @@ def _format_escalation_text(
         f"Логи: печать завершена успешно: {evidence.log_print_success}",
         f"Подозрение на массовый сбой: {evidence.mass_outage_suspected} "
         f"({evidence.neighbor_failure_count}/{evidence.neighbor_total_checked} соседей без сигнала)",
-        f"Состояние аппарата сейчас: "
-        + (f"офлайн" if evidence.printer_currently_offline else "онлайн")
+        "Состояние аппарата сейчас: "
+        + ("офлайн" if evidence.printer_currently_offline else "онлайн")
         + (f", тонер: {evidence.toner_levels}" if evidence.toner_levels else "")
         + (f", ошибка: {evidence.printer_error_text}" if evidence.printer_error_text else "")
         + (f", активный алерт: {evidence.apparat_active_alert}" if evidence.apparat_active_alert else ""),
