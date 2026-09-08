@@ -17,6 +17,9 @@ class TurnContext:
     conversation_id: int
     user_message: str
     api: Any = None
+    # Called by a tool that takes seconds, so the user sees the bot working
+    # instead of a silent gap. Optional: the runtime is testable without one.
+    on_progress: Any = None
     # Where the reading tools put the figures. The model never sees this - it
     # goes on the escalation card, where a person can use it. That is what keeps
     # toner percentages and sheet counts out of the user's reply structurally,

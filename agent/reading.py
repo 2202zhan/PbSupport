@@ -9,10 +9,13 @@ escalation card still gets the exact reading.
 import logging
 
 import apparats
+import diagnosis
+import guard_rules
 import tz
 from agent.registry import ToolError, ToolSpec
 from agent.types import TurnContext
 from api_client import PrintBoxAPIError
+from datetime import datetime  # noqa: F401  (used in a string annotation)
 
 logger = logging.getLogger(__name__)
 
@@ -206,4 +209,160 @@ FIND_MY_ORDERS = ToolSpec(
     parameters={"type": "object", "properties": {}},
     terminal=False,
     run=_find_my_orders,
+)
+
+
+# What the evidence pipeline found, said the way a person would say it. The
+# model is given the conclusion; SNMP, device logs and neighbour scans are ours
+# and stay in the staff note.
+def _print_verdict(evidence) -> str:
+    if evidence.log_download_error:
+        return "аппарат не смог скачать файл с сервера — печать не началась, и это наша ошибка"
+    if evidence.print_signal_confirmed is False:
+        return "принтер не начинал печать по этому заказу"
+    if evidence.log_print_success:
+        return "печать по этому заказу прошла до конца"
+    if evidence.print_signal_confirmed:
+        return "принтер сообщает, что печать прошла"
+    return "по этому заказу техника ничего определённого не говорит"
+
+
+_BLOCKER_WORDS = {
+    "no_transaction_matched": "оплата под описание не нашлась",
+    "already_refunded": "по этому заказу возврат уже делали",
+    "identity_unconfirmed": "оплата с этого telegram-аккаунта не подтверждается",
+    "transaction_ambiguous": "под описание подходит несколько оплат, какая именно — неясно",
+}
+
+
+async def _investigate_order(args: dict, ctx: TurnContext) -> dict:
+    if ctx.on_progress:
+        await ctx.on_progress("🔍 Проверяю заказ по нашим данным…")
+
+    hint_time = _parse_when(args.get("when"))
+    ticket = diagnosis.TicketInput(
+        problem_type="not_printed",
+        apparat_name_text=(args.get("apparat") or "").strip(),
+        telegram_id=ctx.telegram_id,
+        username=ctx.username,
+        contact=None,
+        raw_text=ctx.user_message,
+        submitted_at=tz.now(),
+        manual_hint_amount=_as_amount(args.get("amount")),
+        manual_hint_time=hint_time,
+    )
+    try:
+        evidence = await diagnosis.gather_evidence(ctx.api, ticket)
+    except PrintBoxAPIError:
+        logger.exception("investigation failed for %s", ctx.telegram_id)
+        return {"ошибка": "проверка не прошла — данных нет, зови человека"}
+
+    review = guard_rules.review_refund_case(evidence)
+    ctx.staff_notes.append(_evidence_note(evidence, review))
+
+    transaction = evidence.transaction
+    if transaction is None:
+        return {
+            "оплата_найдена": False,
+            "вывод": (
+                "оплату под это описание найти не удалось. Уточни время и сумму или попроси "
+                "чек — по чеку найдём точно"
+            ),
+            "возврат_возможен": False,
+        }
+
+    return {
+        "оплата_найдена": True,
+        "заказ": {
+            "когда": _when(transaction.date),
+            "аппарат": transaction.machine,
+            "сумма": f"{transaction.amount:g} ₸",
+        },
+        "что_показала_техника": _print_verdict(evidence),
+        "возврат_возможен": review.can_refund,
+        "мешает": [_BLOCKER_WORDS.get(b, b) for b in review.blockers],
+        "как_быть": (
+            "похоже на нашу техническую ошибку — вызывай escalate, возврат подтвердит сотрудник"
+            if review.can_refund
+            else "сам возврат не предлагай: скажи, что нашёл, и передай сотруднику через escalate"
+        ),
+    }
+
+
+def _evidence_note(evidence, review) -> str:
+    t = evidence.transaction
+    lines = [
+        "Проверка заказа:",
+        f"  транзакция: {t.id} {t.date:%d.%m %H:%M} {t.amount} ₸ {t.machine}" if t else "  транзакция: не найдена",
+        f"  идентификация: {'подтверждена' if evidence.identity_confirmed else 'НЕТ'}",
+        f"  SNMP подтвердил печать: {evidence.print_signal_confirmed}",
+        f"  ошибка скачивания в логах: {evidence.log_download_error}",
+        f"  логи: печать завершена: {evidence.log_print_success}",
+        f"  документ найден: {evidence.document_found}",
+    ]
+    if evidence.mass_outage_suspected:
+        lines.append(
+            f"  ⚠️ подозрение на массовый сбой: {evidence.neighbor_failure_count}"
+            f"/{evidence.neighbor_total_checked} соседних заказов"
+        )
+    if evidence.apparat_active_alert:
+        lines.append(f"  ⚠️ аппарат сейчас: {evidence.apparat_active_alert}")
+    lines.append(f"  возврат по правилам: {'можно' if review.can_refund else 'нельзя'}")
+    if review.blockers:
+        lines.append(f"  блокеры: {', '.join(review.blocker_labels)}")
+    if review.warnings:
+        lines.append(f"  предупреждения: {', '.join(review.warning_labels)}")
+    return "\n".join(lines)
+
+
+_WHEN_MINUTES = {
+    "только что": 2, "just_now": 2,
+    "минут 20 назад": 20, "recent": 20,
+    "час назад": 60, "пару часов назад": 120, "hours": 120,
+    "сегодня раньше": 300, "today": 300,
+    "вчера": 60 * 24, "yesterday": 60 * 24,
+}
+
+
+def _parse_when(raw) -> "datetime | None":
+    if not raw or not isinstance(raw, str):
+        return None
+    minutes = _WHEN_MINUTES.get(raw.strip().lower())
+    if minutes is None:
+        return None
+    from datetime import timedelta
+
+    return tz.now() - timedelta(minutes=minutes)
+
+
+def _as_amount(raw) -> float | None:
+    try:
+        return float(str(raw).replace(",", ".").strip()) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+INVESTIGATE_ORDER = ToolSpec(
+    name="investigate_order",
+    description=(
+        "Полная проверка конкретного заказа: была ли оплата, дошёл ли файл до аппарата, "
+        "печатал ли принтер, можно ли по нашим правилам возвращать деньги. Это главный "
+        "инструмент по жалобе «оплатил, а не распечатал» — вызывай его, а не гадай. "
+        "Работает несколько секунд. Чем точнее время и сумма, тем точнее найдём заказ."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "when": {
+                "type": "string",
+                "enum": ["только что", "минут 20 назад", "час назад", "пару часов назад",
+                         "сегодня раньше", "вчера"],
+                "description": "Когда это было, со слов юзера.",
+            },
+            "amount": {"type": "string", "description": "Сумма оплаты в тенге, если юзер назвал."},
+            "apparat": {"type": "string", "description": "Аппарат или корпус, если юзер назвал."},
+        },
+    },
+    terminal=False,
+    run=_investigate_order,
 )

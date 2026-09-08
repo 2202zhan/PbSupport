@@ -241,11 +241,12 @@ def test_only_the_talking_tools_end_the_turn():
     # Reading tools feed the model and the loop continues; only reply and
     # escalate finish a turn.
     assert {s["function"]["name"] for s in DEFAULT_TOOLS.schemas} == {
-        "service_info", "check_apparat", "find_my_orders", "reply", "escalate",
+        "service_info", "check_apparat", "find_my_orders", "investigate_order",
+        "reply", "escalate",
     }
     assert DEFAULT_TOOLS.get("reply").terminal
     assert DEFAULT_TOOLS.get("escalate").terminal
-    for name in ("service_info", "check_apparat", "find_my_orders"):
+    for name in ("service_info", "check_apparat", "find_my_orders", "investigate_order"):
         assert not DEFAULT_TOOLS.get(name).terminal
 
 

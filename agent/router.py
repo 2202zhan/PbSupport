@@ -112,9 +112,28 @@ async def _handle(
             conversation_id=conversation.id,
             user_message=text,
             api=api,
+            on_progress=_progress(message),
         )
         result = await run_turn(ctx)
         await deliver(bot, message, conversation.id, result, user=user, staff_notes=ctx.staff_notes)
+
+
+def _progress(message: Message):
+    """Lets a slow tool say it is working. The first note is a new message and
+    the rest edit it, so a long check leaves one line in the chat rather than a
+    running commentary - and a failure to post one never costs the answer."""
+    sent: list[Message] = []
+
+    async def _say(text: str) -> None:
+        try:
+            if sent:
+                await sent[0].edit_text(text)
+            else:
+                sent.append(await message.answer(text))
+        except Exception:
+            logger.debug("could not post progress", exc_info=True)
+
+    return _say
 
 
 async def deliver(

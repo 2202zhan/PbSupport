@@ -163,3 +163,122 @@ async def test_a_broken_api_says_so_instead_of_pretending():
     ctx = _ctx(_Api(raise_=True))
     apparat_answer = await CHECK_APPARAT.run({"place": "аппарат 3"}, ctx)
     assert "нужно_уточнить" in apparat_answer or "показаний" in apparat_answer["состояние"]
+
+
+class _EvidenceApi(_Api):
+    """Enough of the API for gather_evidence to run without the network."""
+
+    async def get_printer_history(self, apparat_id, limit=50, offset=0):
+        return []
+
+    async def get_printer_alerts(self):
+        return []
+
+    async def get_printer_summary(self):
+        return {}
+
+    async def get_telegram_documents(self, telegram_id):
+        return []
+
+    async def request_device_logs(self, apparat_id, lines=1000, log_type="print"):
+        return None
+
+    async def get_device_logs(self, apparat_id, log_type="print"):
+        return ""
+
+
+def _evidence(**overrides):
+    from diagnosis import Evidence, TicketInput
+
+    ticket = TicketInput(
+        problem_type="not_printed", apparat_name_text="Аппарат №3", telegram_id="884013433",
+        username="zhan", contact=None, raw_text="не вышло", submitted_at=tz.now(),
+    )
+    defaults = dict(
+        ticket=ticket, identity_confirmed=True, transaction=_transaction(5, 80, "63192"),
+        apparat=None,
+    )
+    defaults.update(overrides)
+    return Evidence(**defaults)
+
+
+async def _investigate(monkeypatch, evidence, ctx=None):
+    from agent.reading import INVESTIGATE_ORDER
+
+    async def _gather(_api, _ticket):
+        return evidence
+
+    monkeypatch.setattr("diagnosis.gather_evidence", _gather)
+    ctx = ctx or _ctx(_EvidenceApi())
+    return await INVESTIGATE_ORDER.run({"when": "только что"}, ctx), ctx
+
+
+async def test_the_technical_verdict_reaches_the_model_in_plain_words(monkeypatch):
+    answer, _ = await _investigate(
+        monkeypatch, _evidence(print_signal_confirmed=False, log_download_error=True)
+    )
+    assert "не смог скачать файл" in answer["что_показала_техника"]
+    assert answer["возврат_возможен"] is True
+
+
+async def test_our_instruments_are_not_named_to_the_model(monkeypatch):
+    answer, ctx = await _investigate(
+        monkeypatch, _evidence(print_signal_confirmed=False, log_download_error=True)
+    )
+    rendered = str(answer).lower()
+    for internal in ("snmp", "log_", "print_signal", "лог"):
+        assert internal not in rendered, internal
+    # They are exactly what a person needs, so they go on the card.
+    assert "SNMP" in ctx.staff_notes[0]
+
+
+async def test_a_successful_print_is_reported_as_such(monkeypatch):
+    answer, _ = await _investigate(
+        monkeypatch, _evidence(print_signal_confirmed=True, log_print_success=True)
+    )
+    assert "прошла до конца" in answer["что_показала_техника"]
+
+
+async def test_a_blocked_refund_says_why_without_jargon(monkeypatch):
+    answer, _ = await _investigate(monkeypatch, _evidence(already_refunded=True))
+    assert answer["возврат_возможен"] is False
+    assert any("возврат уже делали" in b for b in answer["мешает"])
+    assert "сам возврат не предлагай" in answer["как_быть"]
+
+
+async def test_no_payment_found_asks_for_more_instead_of_guessing(monkeypatch):
+    answer, _ = await _investigate(monkeypatch, _evidence(transaction=None))
+    assert answer["оплата_найдена"] is False
+    assert "чек" in answer["вывод"]
+
+
+async def test_a_mass_outage_is_flagged_to_staff(monkeypatch):
+    _, ctx = await _investigate(
+        monkeypatch,
+        _evidence(print_signal_confirmed=False, mass_outage_suspected=True,
+                  neighbor_failure_count=5, neighbor_total_checked=7),
+    )
+    assert "массовый сбой" in ctx.staff_notes[0]
+
+
+async def test_the_user_is_told_the_check_is_running(monkeypatch):
+    said = []
+
+    async def _progress(text):
+        said.append(text)
+
+    ctx = _ctx(_EvidenceApi())
+    ctx.on_progress = _progress
+    await _investigate(monkeypatch, _evidence(), ctx=ctx)
+    assert said and "Проверяю" in said[0]
+
+
+async def test_a_broken_investigation_calls_for_a_human(monkeypatch):
+    from agent.reading import INVESTIGATE_ORDER
+
+    async def _boom(_api, _ticket):
+        raise PrintBoxAPIError("down")
+
+    monkeypatch.setattr("diagnosis.gather_evidence", _boom)
+    answer = await INVESTIGATE_ORDER.run({}, _ctx(_EvidenceApi()))
+    assert "зови человека" in answer["ошибка"]

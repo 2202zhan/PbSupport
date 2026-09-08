@@ -9,7 +9,7 @@ never sees and the escalation card does.
 from typing import Any
 
 from agent import guards
-from agent.reading import CHECK_APPARAT, FIND_MY_ORDERS, SERVICE_INFO
+from agent.reading import CHECK_APPARAT, FIND_MY_ORDERS, INVESTIGATE_ORDER, SERVICE_INFO
 from agent.registry import ToolError, ToolRegistry, ToolSpec
 from agent.types import TurnContext, TurnResult
 
@@ -146,4 +146,6 @@ ESCALATE = ToolSpec(
     run=_escalate,
 )
 
-DEFAULT_TOOLS = ToolRegistry([SERVICE_INFO, CHECK_APPARAT, FIND_MY_ORDERS, REPLY, ESCALATE])
+DEFAULT_TOOLS = ToolRegistry(
+    [SERVICE_INFO, CHECK_APPARAT, FIND_MY_ORDERS, INVESTIGATE_ORDER, REPLY, ESCALATE]
+)
