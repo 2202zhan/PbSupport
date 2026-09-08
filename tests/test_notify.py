@@ -299,3 +299,40 @@ async def test_rejection_still_completes_if_the_user_blocked_the_bot():
 
     status_mock.assert_called_once_with(1, "resolved_rejected")
     callback.message.edit_text.assert_called_once()
+
+
+def test_closing_a_non_money_case_says_nothing_about_refunds():
+    # Ticket #46 was "QR-код не появился" - no payment was ever in question, so
+    # closing it with a paragraph about receipts shows we didn't read it.
+    ticket = _fake_ticket(transaction_id=None)
+    ticket.payment_expected = 0
+    text = notify._closing_message(ticket)
+    for word in ["возврат", "чек", "оплат"]:
+        assert word not in text.lower(), text
+
+
+def test_closing_a_paid_case_without_a_transaction_offers_the_receipt_route():
+    ticket = _fake_ticket(transaction_id=None)
+    text = notify._closing_message(ticket)
+    assert "чек" in text.lower()
+
+
+def test_closing_a_paid_case_with_a_transaction_explains_no_fault_was_found():
+    text = notify._closing_message(_fake_ticket(transaction_id="tx-1"))
+    assert "не нашли" in text.lower()
+
+
+def test_close_button_drops_the_refund_wording_when_money_was_never_involved():
+    money = notify._escalation_keyboard(1, can_refund=False, payment_expected=True)
+    no_money = notify._escalation_keyboard(1, can_refund=False, payment_expected=False)
+    money_label = money.inline_keyboard[0][0].text
+    no_money_label = no_money.inline_keyboard[0][0].text
+    assert "возврат" in money_label.lower()
+    assert "возврат" not in no_money_label.lower()
+
+
+def test_receipt_button_is_hidden_when_no_payment_could_exist():
+    kb = notify._escalation_keyboard(1, can_refund=False, payment_expected=False)
+    callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert not any(c.startswith(notify._ASK_RECEIPT_PREFIX) for c in callbacks)
+    assert any(c.startswith(notify._REPLY_PREFIX) for c in callbacks)

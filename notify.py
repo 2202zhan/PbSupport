@@ -52,10 +52,15 @@ _RECEIPT_REQUEST_TEMPLATE = (
     "закончить проверку. Пришлите, пожалуйста, фото или PDF чека прямо сюда."
 )
 
-# A rejection has to reach the user too - the bot promised "отвечу здесь", and
-# silence after that reads as being ignored. Two wordings, because "we couldn't
-# find your payment at all" and "we found it and saw no fault" are different
-# news and deserve different next steps.
+# A closed case has to reach the user too - the bot promised "отвечу здесь", and
+# silence after that reads as being ignored. Which wording fits depends on what
+# the complaint was about in the first place: answering "QR не появился" with a
+# paragraph about receipts and refunds shows we didn't read it.
+_CLOSED_NEUTRAL_TEMPLATE = (
+    "🔍 Заявка #{ticket_id} закрыта — сотрудник её посмотрел.\n\n"
+    "Если ситуация повторится, отправьте /start и оформите новое обращение: разберёмся."
+)
+
 _REJECTED_NO_PAYMENT_TEMPLATE = (
     "🔍 Заявка #{ticket_id} закрыта: подтвердить оплату по этому заказу не удалось, "
     "поэтому оформить возврат мы не можем.\n\n"
@@ -70,13 +75,23 @@ _REJECTED_TEMPLATE = (
     "посмотрим ещё раз."
 )
 
+
+def _closing_message(ticket) -> str:
+    """Money wording only where money was ever on the table."""
+    if not ticket.payment_expected:
+        return _CLOSED_NEUTRAL_TEMPLATE.format(ticket_id=ticket.id)
+    template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
+    return template.format(ticket_id=ticket.id)
+
 # Threads where a staff member tapped "Ответить" and their next message should
 # go to the user. Deliberately in memory: it lives for seconds, and losing it
 # on restart just means the message isn't relayed - nothing breaks.
 _awaiting_staff_reply: set[int] = set()
 
 
-def _escalation_keyboard(ticket_id: int, can_refund: bool) -> InlineKeyboardMarkup:
+def _escalation_keyboard(
+    ticket_id: int, can_refund: bool, payment_expected: bool = True
+) -> InlineKeyboardMarkup:
     rows = []
     if can_refund:
         rows.append(
@@ -87,16 +102,22 @@ def _escalation_keyboard(ticket_id: int, can_refund: bool) -> InlineKeyboardMark
         )
     else:
         # Refunding would be wrong or would simply fail here (see
-        # guard_rules.review_refund_case) - don't offer a button that lies.
-        rows.append(
-            [InlineKeyboardButton(text="❌ Закрыть без возврата", callback_data=f"{_REJECT_PREFIX}{ticket_id}")]
+        # guard_rules.review_refund_case) - don't offer a button that lies. And
+        # on a complaint that was never about money, "без возврата" is itself
+        # the wrong frame.
+        label = "❌ Закрыть без возврата" if payment_expected else "❌ Закрыть"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"{_REJECT_PREFIX}{ticket_id}")])
+    # A receipt only exists where a payment could have happened; on "QR не
+    # появился" or a failed upload there is nothing to ask for.
+    second_row = []
+    if payment_expected:
+        second_row.append(
+            InlineKeyboardButton(text="📎 Запросить чек", callback_data=f"{_ASK_RECEIPT_PREFIX}{ticket_id}")
         )
-    rows.append(
-        [
-            InlineKeyboardButton(text="📎 Запросить чек", callback_data=f"{_ASK_RECEIPT_PREFIX}{ticket_id}"),
-            InlineKeyboardButton(text="✍️ Ответить", callback_data=f"{_REPLY_PREFIX}{ticket_id}"),
-        ]
+    second_row.append(
+        InlineKeyboardButton(text="✍️ Ответить", callback_data=f"{_REPLY_PREFIX}{ticket_id}")
     )
+    rows.append(second_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -224,10 +245,12 @@ async def send_escalation(
     )
     text = _format_escalation_text(ticket_id, evidence, decision, review)
     can_refund = bool(review.can_refund) if review is not None else bool(evidence.transaction)
+    ticket_record = await storage.get_ticket(ticket_id)
+    payment_expected = bool(ticket_record.payment_expected) if ticket_record else True
     message = await bot.send_message(
         staff_chat_id,
         text,
-        reply_markup=_escalation_keyboard(ticket_id, can_refund),
+        reply_markup=_escalation_keyboard(ticket_id, can_refund, payment_expected),
         message_thread_id=thread_id,
     )
     await storage.create_escalation(ticket_id, staff_chat_id, message.message_id)
@@ -258,7 +281,11 @@ async def send_plain_escalation(bot: Bot, staff_chat_id: int, ticket_id: int, de
     message = await bot.send_message(
         staff_chat_id,
         format_plain_escalation_text(ticket_id, ticket_record, decision),
-        reply_markup=_escalation_keyboard(ticket_id, can_refund=False),
+        reply_markup=_escalation_keyboard(
+            ticket_id,
+            can_refund=False,
+            payment_expected=bool(ticket_record.payment_expected) if ticket_record else True,
+        ),
         message_thread_id=thread_id,
     )
     await storage.create_escalation(ticket_id, staff_chat_id, message.message_id)
@@ -319,11 +346,8 @@ async def handle_escalation_decision(callback: CallbackQuery, bot: Bot, api: Pri
         new_text = callback.message.text + f"\n\n✅ Возврат подтверждён ({staff_name})"
     else:
         await storage.set_ticket_status(ticket_id, "resolved_rejected")
-        template = _REJECTED_TEMPLATE if ticket.transaction_id else _REJECTED_NO_PAYMENT_TEMPLATE
         try:
-            await bot.send_message(
-                int(ticket.telegram_id), template.format(ticket_id=ticket_id)
-            )
+            await bot.send_message(int(ticket.telegram_id), _closing_message(ticket))
         except Exception:
             logger.exception("could not tell the user ticket %s was rejected", ticket_id)
         new_text = callback.message.text + f"\n\n❌ Отклонено ({staff_name})"
