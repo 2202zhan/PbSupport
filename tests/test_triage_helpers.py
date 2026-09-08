@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -595,3 +596,60 @@ def test_sheet_counts_use_the_right_russian_form():
     assert triage._sheets_word(5) == "листов"
     assert triage._sheets_word(11) == "листов"
     assert triage._sheets_word(21) == "лист"
+
+
+async def test_a_receipt_from_months_ago_is_refused_not_escalated(monkeypatch):
+    # Reported case: the ticket said "сегодня", the attached receipt was from
+    # June. It sailed through to staff as "нужна ручная проверка" - the age
+    # check existed, but only on the normal intake path, not here.
+    import receipt_parser
+
+    async def _extract(bot, message):
+        return "file-1", True, receipt_parser.ReceiptData(
+            amount=35.0, paid_at=datetime(2026, 6, 18, 11, 58, 12), receipt_number="QR16068964665"
+        )
+
+    escalated = []
+
+    async def _escalate(*args, **kwargs):
+        escalated.append(True)
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage, "_escalate", _escalate)
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 14, 0))
+    monkeypatch.setattr(triage.storage, "set_ticket_status", lambda *a: asyncio.sleep(0))
+
+    message = _RecordingMessage("")
+    state = _FakeState({"awaiting_post_diagnosis_receipt": True, "ticket_id": 58})
+    await triage.on_receipt_received(message, state, bot=None, api=None)
+
+    assert not escalated, "an out-of-window receipt must not reach staff"
+    assert any("18.06.2026" in t for t in message.answered_with)
+
+
+async def test_a_recent_receipt_still_triggers_a_second_look(monkeypatch):
+    import receipt_parser
+
+    async def _extract(bot, message):
+        return "file-1", True, receipt_parser.ReceiptData(
+            amount=35.0, paid_at=datetime(2026, 9, 8, 13, 40), receipt_number="QR1"
+        )
+
+    rechecked = []
+
+    async def _cycle(*args, **kwargs):
+        rechecked.append(True)
+
+    async def _get_ticket(_id):
+        return _record(problem_type="not_printed", apparat_name="Аппарат №1")
+
+    monkeypatch.setattr(triage, "_extract_receipt_data", _extract)
+    monkeypatch.setattr(triage, "_run_decision_cycle", _cycle)
+    monkeypatch.setattr(triage.storage, "get_ticket", _get_ticket)
+    monkeypatch.setattr(triage.tz, "now", lambda: datetime(2026, 9, 8, 14, 0))
+
+    message = _RecordingMessage("")
+    state = _FakeState({"awaiting_post_diagnosis_receipt": True, "ticket_id": 58})
+    await triage.on_receipt_received(message, state, bot=None, api=None)
+
+    assert rechecked == [True]

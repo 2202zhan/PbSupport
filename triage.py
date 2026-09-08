@@ -1116,6 +1116,24 @@ async def on_receipt_received(message: Message, state: FSMContext, bot: Bot, api
     data = await state.get_data()
     if data.get("awaiting_post_diagnosis_receipt"):
         ticket_id = data["ticket_id"]
+        if parsed is not None and _is_too_old(parsed.paid_at):
+            # The receipt is the ground truth about when this happened, and it
+            # can contradict the ticket outright - someone sending a payment
+            # from three months ago has attached the wrong file. Catch it here
+            # rather than re-running the investigation and handing staff a case
+            # that was never actionable.
+            await storage.set_ticket_status(ticket_id, "too_old")
+            await message.answer(
+                f"На чеке указано {parsed.paid_at:%d.%m.%Y %H:%M} — это больше суток назад, "
+                "а такие заявки мы проверить уже не можем: технические данные за тот период "
+                "не сохраняются.\n\nЕсли проблема была сегодня — пришлите, пожалуйста, чек "
+                "именно за неё.",
+                reply_markup=_main_menu_keyboard(),
+            )
+            sessions.forget(str(message.from_user.id))
+            await state.clear()
+            return
+
         if parsed is not None:
             # Got exact data from the receipt - worth a real second look instead of
             # jumping straight to "let a human sort it out".
