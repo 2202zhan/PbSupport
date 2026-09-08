@@ -682,19 +682,38 @@ async def _suggest_alternate_apparat(api: PrintBoxAPIClient, apparat_name_text: 
 _LOW_PAGES = 50
 _LOW_TONER = 20
 
+# The kiosks are powered on 08:00-19:00 Asia/Almaty. Outside that they're off,
+# so a status read says nothing about the machine - only that it's night.
+_WORKDAY_START_HOUR = 8
+_WORKDAY_END_HOUR = 19
+
+
+def _apparats_are_awake() -> bool:
+    return _WORKDAY_START_HOUR <= tz.now().hour < _WORKDAY_END_HOUR
+
 
 async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tuple[str, str]:
-    """Looks up what the machine itself reports about paper and toner, so a
-    "закончилась бумага" report doesn't reach staff as bare hearsay. Returns
-    (what to tell the user, what to tell staff)."""
+    """Looks up what the machine reports about paper and toner, so a "закончилась
+    бумага" report doesn't reach staff as bare hearsay.
+
+    Returns (verdict, staff_note). The verdict is "confirmed" when something is
+    genuinely low or the apparat is reporting an error, "healthy" when it says
+    everything is in order, and "unknown" when we couldn't ask - at night the
+    kiosks are switched off, and a reading taken then means nothing.
+
+    Exact figures go to staff only; the user gets a plain answer, not a dump of
+    our counters.
+    """
+    if not _apparats_are_awake():
+        return "unknown", f"аппараты выключены (сейчас {tz.now():%H:%M}), показаний нет"
     try:
         apparat = await diagnosis.find_apparat_by_name(api, apparat_name_text)
         statuses = await api.get_all_printer_statuses()
     except PrintBoxAPIError:
         logger.warning("could not read supplies for %s", apparat_name_text)
-        return "", "показания аппарата сейчас недоступны"
+        return "unknown", "показания аппарата сейчас недоступны"
     if apparat is None:
-        return "", "аппарат не найден в справочнике"
+        return "unknown", "аппарат не найден в справочнике"
 
     current = next((s for s in statuses if s.get("apparat_id") == apparat.id), None) or {}
     toner = {k: v for k, v in (current.get("toner") or {}).items() if isinstance(v, (int, float))}
@@ -709,21 +728,14 @@ async def _read_supplies(api: PrintBoxAPIClient, apparat_name_text: str) -> tupl
         findings.append(f"тонер {lowest_toner}%")
     if error_text:
         findings.append(f"аппарат сообщает: {error_text}")
-    staff_note = ", ".join(findings) if findings else "показаний от аппарата нет"
+    if not findings:
+        return "unknown", "показаний от аппарата нет"
 
-    confirms = bool(error_text) or (pages is not None and pages < _LOW_PAGES) or (
+    staff_note = ", ".join(findings)
+    confirmed = bool(error_text) or (pages is not None and pages < _LOW_PAGES) or (
         lowest_toner is not None and lowest_toner < _LOW_TONER
     )
-    if confirms:
-        user_note = f" Проверил — {staff_note}. Похоже, так и есть."
-    elif findings:
-        user_note = (
-            f" Проверил — по нашим счётчикам осталось {staff_note}. Счётчик может расходиться "
-            "с тем, что в лотке (например, замялся лист), поэтому передаю сотруднику."
-        )
-    else:
-        user_note = ""
-    return user_note, staff_note
+    return ("confirmed" if confirmed else "healthy"), staff_note
 
 
 def _sheets_word(n: int) -> str:
@@ -741,7 +753,22 @@ async def _report_device_issue(
     telegram_id = str(callback.from_user.id)
     username = callback.from_user.username
     await callback.message.edit_text("🔍 Проверяю состояние аппарата...")
-    user_note, staff_note = await _read_supplies(api, apparat_name_text)
+    verdict, staff_note = await _read_supplies(api, apparat_name_text)
+
+    if verdict == "healthy":
+        # The apparat reports its own faults through error_text, so a clean
+        # reading plus full counters means there is nothing for staff to carry
+        # over. Close it here rather than sending someone on a wasted trip -
+        # and leave an obvious way back if printing really is failing.
+        await callback.message.edit_text(
+            f"Проверил аппарат «{apparat_name_text}» — бумага и тонер на месте, об ошибках "
+            "он не сообщает.\n\nЕсли распечатка всё равно не выходит, выберите «📞 Сообщить "
+            "о проблеме» → «Не печатает документ»: там я проверю ваш заказ по нашим данным.",
+            reply_markup=_main_menu_keyboard(),
+        )
+        sessions.forget(telegram_id)
+        await state.clear()
+        return
 
     ticket_id = await storage.create_ticket(
         telegram_id=telegram_id,
@@ -761,10 +788,16 @@ async def _report_device_issue(
             f"бумага или тонер.\nПоказания аппарата: {staff_note}.",
         ),
     )
+    # Figures stay on the staff side - the user needs to know we looked and
+    # what happens next, not our counter readings.
+    if verdict == "confirmed":
+        checked = " Проверил — аппарат действительно сообщает о нехватке расходников."
+    else:
+        checked = ""
     alternate = await _suggest_alternate_apparat(api, apparat_name_text)
     note = f" Пока можно воспользоваться аппаратом «{alternate}», если рядом." if alternate else ""
     await callback.message.edit_text(
-        f"Спасибо!{user_note} Передал сотруднику — на аппарате «{apparat_name_text}» "
+        f"Спасибо!{checked} Передал сотруднику — на аппарате «{apparat_name_text}» "
         f"проверят бумагу и тонер.{note}",
         reply_markup=_main_menu_keyboard(),
     )
