@@ -10,6 +10,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 
+import agent
 import csat
 import notify
 import sessions
@@ -89,6 +90,10 @@ async def main() -> None:
 
     bot = Bot(token=settings.support_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    # Ahead of triage: whoever the gate admits is handled by the agent and
+    # never reaches the menu tree. Everyone else falls through unchanged.
+    logger.info(agent.describe_mode())
+    dp.include_router(agent.router)
     dp.include_router(triage.router)
     dp.include_router(notify.router)
     dp.include_router(csat.router)

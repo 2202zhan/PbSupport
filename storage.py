@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -7,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickets (
@@ -45,6 +48,27 @@ CREATE TABLE IF NOT EXISTS escalations (
     resolved_by TEXT,
     resolution TEXT,
     resolved_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- One row per turn the agent takes, written whether the turn succeeded or
+-- failed. This is how the new path gets compared with the old one instead of
+-- guessed about: what came in, which tools ran, what went out, how long it
+-- took and what it cost.
+CREATE TABLE IF NOT EXISTS agent_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER,
+    telegram_id TEXT NOT NULL,
+    user_message TEXT,
+    tool_calls TEXT,
+    outcome TEXT NOT NULL,
+    reply TEXT,
+    error TEXT,
+    model_calls INTEGER NOT NULL DEFAULT 0,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -150,6 +174,71 @@ async def create_ticket(
         _create_ticket_sync, telegram_id, username, contact, problem_type, apparat_name,
         raw_text, payment_expected,
     )
+
+
+def _record_agent_turn_sync(
+    telegram_id: str,
+    outcome: str,
+    user_message: str | None,
+    reply: str | None,
+    tool_calls: list[str] | None,
+    error: str | None,
+    model_calls: int,
+    latency_ms: int | None,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    conversation_id: int | None,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO agent_turns (
+                   conversation_id, telegram_id, user_message, tool_calls, outcome, reply,
+                   error, model_calls, tool_call_count, latency_ms, prompt_tokens,
+                   completion_tokens, created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                conversation_id, telegram_id, user_message,
+                json.dumps(tool_calls or [], ensure_ascii=False), outcome, reply, error,
+                model_calls, len(tool_calls or []), latency_ms, prompt_tokens,
+                completion_tokens, _now(),
+            ),
+        )
+
+
+async def record_agent_turn(
+    telegram_id: str,
+    outcome: str,
+    user_message: str | None = None,
+    reply: str | None = None,
+    tool_calls: list[str] | None = None,
+    error: str | None = None,
+    model_calls: int = 0,
+    latency_ms: int | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    conversation_id: int | None = None,
+) -> None:
+    """Never let bookkeeping break a conversation: a failed write is logged and
+    swallowed, because losing a metric is cheaper than losing the user's turn."""
+    try:
+        await asyncio.to_thread(
+            _record_agent_turn_sync, telegram_id, outcome, user_message, reply, tool_calls,
+            error, model_calls, latency_ms, prompt_tokens, completion_tokens, conversation_id,
+        )
+    except Exception:
+        logger.exception("could not record agent turn for %s", telegram_id)
+
+
+def _recent_agent_turns_sync(limit: int) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM agent_turns ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def recent_agent_turns(limit: int = 20) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_recent_agent_turns_sync, limit)
 
 
 def _get_ticket_sync(ticket_id: int) -> TicketRecord | None:

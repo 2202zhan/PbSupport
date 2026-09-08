@@ -32,5 +32,13 @@ class Settings(BaseSettings):
 
     support_bot_db_path: str = "./support_bot.sqlite3"
 
+    # Who talks to the conversational agent instead of the menu tree:
+    # "off" - nobody, "admin" - the ids in admin_telegram_ids, "all" - everyone.
+    # Lets the new path be tried on real traffic without a second bot token,
+    # and rolled back with one environment variable. Anything unrecognised is
+    # treated as "off": an unreadable flag must not hand users to a half-built
+    # path.
+    agent_mode: str = "off"
+
 
 settings = Settings()
