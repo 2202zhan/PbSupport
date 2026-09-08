@@ -641,3 +641,49 @@ async def test_not_printed_document_found_false_when_no_documents_at_all(monkeyp
 
 async def _no_sleep(*args, **kwargs):
     return None
+
+
+async def test_simultaneous_orders_are_not_counted_as_failures(monkeypatch):
+    # Real pattern from Аппарат №3: people send several documents at once and
+    # the kiosk writes them as separate transactions in the same second. Each
+    # one bounded by the next left a window that closed before the order was
+    # even placed, so no print could fall inside it - and a busy minute was
+    # reported as "7 of 10 neighbours without signal".
+    monkeypatch.setattr(diagnosis.asyncio, "sleep", _no_sleep)
+    api = FakeAPI()
+    base = datetime(2026, 9, 8, 14, 13, 43)
+
+    # Three bursts of three simultaneous orders, all printing fine.
+    for burst in range(3):
+        when = base + timedelta(minutes=15 * burst)
+        for n in range(3):
+            api.transactions.append(_tx("other", when, f"tx-{burst}-{n}"))
+        api.printer_history.append(
+            PrinterStatusEvent(is_online=True, status="Printing", error_text=None,
+                                created_at=when + timedelta(seconds=20))
+        )
+    target_time = base + timedelta(minutes=4)
+    api.transactions.append(_tx("123", target_time, "tx-target"))
+    api.printer_history.append(
+        PrinterStatusEvent(is_online=True, status="Printing", error_text=None,
+                            created_at=target_time + timedelta(seconds=15))
+    )
+
+    evidence = await gather_evidence(api, _ticket(manual_hint_time=target_time))
+
+    assert evidence.mass_outage_suspected is False
+    assert evidence.neighbor_failure_count == 0
+    # Only the separable orders are counted at all.
+    assert evidence.neighbor_total_checked < 9
+
+
+def test_signal_bounds_refuses_a_window_that_closes_before_the_order():
+    base = datetime(2026, 9, 8, 14, 13, 43)
+    burst = [_tx("u", base, "a"), _tx("u", base, "b"), _tx("u", base + timedelta(minutes=4), "c")]
+    # First of a same-second pair: nothing can be attributed to it.
+    assert diagnosis._signal_bounds(burst, 0) is None
+    # Last before a distant order: a normal, usable window.
+    bounds = diagnosis._signal_bounds(burst, 1)
+    assert bounds is not None
+    lower, upper = bounds
+    assert upper > burst[1].date

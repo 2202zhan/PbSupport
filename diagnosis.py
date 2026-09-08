@@ -197,8 +197,12 @@ async def _pick_unprinted_candidate(api: PrintBoxAPIClient, candidates: list[Tra
         idx = next((i for i, p in enumerate(order_pool) if p.id == t.id), None)
         if idx is None:
             continue
-        lower, upper = _signal_bounds(order_pool, idx)
-        signal = await _check_print_signal(api, apparat.id, lower, upper)
+        bounds = _signal_bounds(order_pool, idx)
+        if bounds is None:
+            # Can't attribute a signal to this one - it tells us nothing either
+            # way, so it must not be picked as "the one that didn't print".
+            continue
+        signal = await _check_print_signal(api, apparat.id, *bounds)
         if signal is not True:
             unconfirmed.append(t)
     return unconfirmed[0] if len(unconfirmed) == 1 else None
@@ -250,15 +254,32 @@ async def _build_order_pool(api: PrintBoxAPIClient, machine_name: str) -> list[T
     return pool
 
 
-def _signal_bounds(pool: list[Transaction], idx: int) -> tuple[datetime, datetime]:
+# A print needs at least this long after payment before its "Printing" event
+# can plausibly show up in the SNMP history.
+_MIN_SIGNAL_WINDOW = timedelta(seconds=10)
+
+
+def _signal_bounds(pool: list[Transaction], idx: int) -> tuple[datetime, datetime] | None:
     """Time window to look for *this* order's print signal: from shortly before
     payment to either the configured window or the next order on this apparat,
-    whichever comes first - so a neighboring job's signal can't leak in."""
+    whichever comes first - so a neighboring job's signal can't leak in.
+
+    Returns None when the orders are too close together to tell apart. People
+    routinely send several documents at once and the kiosk writes them as
+    separate transactions in the same second; bounding each by the next one
+    then leaves a window that closes before the order was even placed, so no
+    print could ever fall inside it. Reporting that as "did not print" turned
+    a busy minute into a phantom mass outage - the honest answer is that this
+    order's signal cannot be attributed, and the device logs (which carry
+    filenames) are the way to tell them apart.
+    """
     target = pool[idx]
     lower = target.date - timedelta(seconds=30)
     upper = target.date + timedelta(minutes=settings.print_signal_window_minutes)
     if idx + 1 < len(pool):
         upper = min(upper, pool[idx + 1].date - timedelta(seconds=5))
+    if upper - target.date < _MIN_SIGNAL_WINDOW:
+        return None
     return lower, upper
 
 
@@ -453,8 +474,17 @@ async def gather_evidence(api: PrintBoxAPIClient, ticket: TicketInput) -> Eviden
             # to a plain forward-looking window with no neighbor information.
             pool, idx = [transaction], 0
 
-        lower, upper = _signal_bounds(pool, idx)
-        evidence.print_signal_confirmed = await _check_print_signal(api, apparat.id, lower, upper)
+        bounds = _signal_bounds(pool, idx)
+        if bounds is None:
+            # Ordered in the same breath as its neighbours - SNMP can't say
+            # which of them printed, so widen to the batch and let the device
+            # logs, which carry filenames, do the telling apart.
+            evidence.print_signal_confirmed = None
+            lower = transaction.date - timedelta(seconds=30)
+            upper = transaction.date + timedelta(minutes=settings.print_signal_window_minutes)
+        else:
+            lower, upper = bounds
+            evidence.print_signal_confirmed = await _check_print_signal(api, apparat.id, lower, upper)
         if evidence.print_signal_confirmed is not True:
             # SNMP didn't confirm printing (confident "no", or no data at all) -
             # check logs too: that's the only way to learn *why* (download error
@@ -481,16 +511,23 @@ async def gather_evidence(api: PrintBoxAPIClient, ticket: TicketInput) -> Eviden
                 range(idx + 1, min(len(pool), idx + 1 + window))
             )
             failures = 0
+            checked = 0
             for ni in neighbor_idxs:
-                n_lower, n_upper = _signal_bounds(pool, ni)
-                ok = await _check_print_signal(api, apparat.id, n_lower, n_upper)
+                n_bounds = _signal_bounds(pool, ni)
+                if n_bounds is None:
+                    # Part of a burst of simultaneous orders - unattributable,
+                    # not failed. Counting these was what invented outages out
+                    # of nothing more than a busy minute.
+                    continue
+                checked += 1
+                ok = await _check_print_signal(api, apparat.id, *n_bounds)
                 # Only a confident "no" counts - an unknown (None, no SNMP data
                 # for that neighbor) shouldn't be mistaken for evidence of an outage.
                 if ok is False:
                     failures += 1
             evidence.neighbor_failure_count = failures
-            evidence.neighbor_total_checked = len(neighbor_idxs)
-            evidence.mass_outage_suspected = len(neighbor_idxs) > 0 and failures >= 2
+            evidence.neighbor_total_checked = checked
+            evidence.mass_outage_suspected = checked > 0 and failures >= 2
 
     return evidence
 
