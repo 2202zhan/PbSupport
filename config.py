@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     agent_verdict_model: str = "gpt-4o"
     # Budgets for one turn. Whatever happens, the turn ends - with an answer,
     # with a human, but never with silence.
-    agent_max_model_calls: int = 3
+    agent_max_model_calls: int = 4
     agent_max_tool_calls: int = 6
     agent_turn_timeout_seconds: int = 45
 

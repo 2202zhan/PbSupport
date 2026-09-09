@@ -66,20 +66,29 @@ def db(tmp_path, monkeypatch):
 
 
 async def test_service_facts_come_from_the_curated_list():
-    answer = await SERVICE_INFO.run({"topic": "hours"}, None)
-    assert "8:00" in answer["факт"] and "19:00" in answer["факт"]
+    answer = await SERVICE_INFO.run({"topics": ["hours"]}, None)
+    assert "8:00" in answer["hours"] and "19:00" in answer["hours"]
+
+
+async def test_several_facts_come_back_in_one_call():
+    # One topic per model call is how "как у вас печатать?" ran out of budget
+    # halfway through its own answer.
+    answer = await SERVICE_INFO.run({"topics": ["hours", "formats", "how_it_works"]}, None)
+    assert set(answer) == {"hours", "formats", "how_it_works"}
 
 
 async def test_an_unknown_topic_is_worth_correcting():
     with pytest.raises(ToolError):
-        await SERVICE_INFO.run({"topic": "погода"}, None)
+        await SERVICE_INFO.run({"topics": ["погода"]}, None)
+    with pytest.raises(ToolError):
+        await SERVICE_INFO.run({}, None)
 
 
 async def test_we_do_not_invent_a_price():
     # There is no price table anywhere in this codebase, so the honest answer
     # is where to look, not a number.
-    answer = await SERVICE_INFO.run({"topic": "prices"}, None)
-    assert "не называй цифры" in answer["факт"]
+    answer = await SERVICE_INFO.run({"topics": ["prices"]}, None)
+    assert "не называй цифры" in answer["prices"]
 
 
 async def test_the_model_is_told_the_verdict_and_never_the_numbers():

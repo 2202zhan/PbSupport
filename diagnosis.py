@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -101,11 +102,27 @@ def _normalize(text: str) -> str:
     return "".join(ch.lower() for ch in text if ch.isalnum())
 
 
+_LETTERS_RE = re.compile(r"[^a-zа-яё]")
+_DIGITS_RE = re.compile(r"\d+")
+
+
 def _machine_matches(machine_name: str, apparat_text: str) -> bool:
     a, b = _normalize(machine_name), _normalize(apparat_text)
     if not a or not b:
         return False
-    return a in b or b in a
+    if a in b or b in a:
+        return True
+    # "на аппарате 3" against "Аппарат №3 3️⃣": the substring test fails on the
+    # case ending and on the emoji's stray digit, so compare the numbers and
+    # the word stem instead. Numbers are compared as a set, since the display
+    # name repeats the machine's own number as an emoji.
+    numbers_a = set(_DIGITS_RE.findall(machine_name))
+    numbers_b = set(_DIGITS_RE.findall(apparat_text))
+    if not numbers_a or numbers_a != numbers_b:
+        return False
+    stem_a = _LETTERS_RE.sub("", machine_name.lower())
+    stem_b = _LETTERS_RE.sub("", apparat_text.lower())
+    return bool(stem_a and stem_b and (stem_a[:6] in stem_b or stem_b[:6] in stem_a))
 
 
 async def _find_transaction(api: PrintBoxAPIClient, ticket: TicketInput) -> tuple[Transaction | None, bool, bool]:

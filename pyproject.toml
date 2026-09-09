@@ -24,9 +24,16 @@ py-modules = [
     "bot", "config", "api_client", "log_parser", "storage",
     "diagnosis", "guard_rules", "ai_decider", "advice", "notify", "triage",
     "tz", "sessions", "concierge", "receipt_parser", "openai_utils",
+    "apparats", "receipts",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# The eval suite drives a real model against a fake PrintBox: slow, costs money
+# and is not deterministic, so it never runs by accident. `pytest -m evals`.
+addopts = "-m 'not evals'"
+markers = [
+    "evals: end-to-end agent scenarios against a real model (needs OPENAI_API_KEY)",
+]
 testpaths = ["tests"]
 pythonpath = ["."]

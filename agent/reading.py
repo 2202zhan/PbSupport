@@ -54,10 +54,15 @@ _TOPICS = {
 
 
 async def _service_info(args: dict, _ctx: TurnContext) -> dict:
-    topic = args.get("topic")
-    if topic not in _TOPICS:
-        raise ToolError(f"неизвестная тема {topic!r}, доступны: {', '.join(_TOPICS)}")
-    return {"тема": topic, "факт": _TOPICS[topic]}
+    raw = args.get("topics") or ([args["topic"]] if args.get("topic") else [])
+    if isinstance(raw, str):
+        raw = [raw]
+    unknown = [t for t in raw if t not in _TOPICS]
+    if unknown or not raw:
+        raise ToolError(f"неизвестные темы {unknown or '(пусто)'}, доступны: {', '.join(_TOPICS)}")
+    # Several at once on purpose: this is a local lookup, and one topic per
+    # model call is how "как у вас печатать?" ran out of budget mid-answer.
+    return {t: _TOPICS[t] for t in raw}
 
 
 SERVICE_INFO = ToolSpec(
@@ -68,8 +73,14 @@ SERVICE_INFO = ToolSpec(
     ),
     parameters={
         "type": "object",
-        "properties": {"topic": {"type": "string", "enum": list(_TOPICS)}},
-        "required": ["topic"],
+        "properties": {
+            "topics": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(_TOPICS)},
+                "description": "Можно и нужно спрашивать несколько тем сразу, одним вызовом.",
+            }
+        },
+        "required": ["topics"],
     },
     terminal=False,
     run=_service_info,
@@ -112,6 +123,13 @@ async def _check_apparat(args: dict, ctx: TurnContext) -> dict:
         alternate = await apparats.suggest_alternate(ctx.api, place)
         if alternate:
             answer["рядом_работает"] = alternate
+    if verdict == apparats.CRITICAL:
+        # Sending the user to another kiosk is not a fix: this one still needs
+        # somebody to walk over to it.
+        answer["как_быть"] = (
+            "аппарат надо обслужить — обязательно вызови escalate, иначе никто не узнает; "
+            "юзеру предложи другой аппарат, пока этот не привели в порядок"
+        )
     return answer
 
 

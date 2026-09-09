@@ -729,3 +729,25 @@ async def test_the_machine_name_still_wins_over_an_address():
     ])
     found = await diagnosis.find_apparat_by_name(api, "Аппарат №2")
     assert found is not None and found.id == 2
+
+
+async def test_a_declined_machine_name_still_matches():
+    # "бледно печатает на аппарате 3" is how people write it. The plain
+    # substring test failed on the case ending and on the display name's own
+    # emoji digit, and the bot answered "такого аппарата не нашёл".
+    api = _ApparatDirectory([
+        _named(3, "Аппарат №3 3️⃣", "Первый корпус"),
+        _named(2, "Аппарат №2", "Второй корпус"),
+    ])
+    for said in ["аппарат 3", "на аппарате 3", "Аппарата №3", "аппарат №3"]:
+        found = await diagnosis.find_apparat_by_name(api, said)
+        assert found is not None and found.id == 3, said
+
+
+async def test_a_different_number_is_still_a_different_machine():
+    api = _ApparatDirectory([
+        _named(3, "Аппарат №3 3️⃣", "Первый корпус"),
+        _named(2, "Аппарат №2", "Второй корпус"),
+    ])
+    found = await diagnosis.find_apparat_by_name(api, "на аппарате 2")
+    assert found is not None and found.id == 2
