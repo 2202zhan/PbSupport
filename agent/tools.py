@@ -74,11 +74,18 @@ async def _escalate(args: dict[str, Any], _ctx: TurnContext) -> TurnResult:
     summary = (args.get("summary_for_staff") or "").strip()
     if not summary:
         raise ToolError("escalate нужен summary_for_staff")
+    draft = (args.get("draft_reply") or "").strip() or None
+    if draft and guards.self_service_advice(draft):
+        raise ToolError("в draft_reply нельзя советовать юзеру обслуживать аппарат, перепиши")
+    confidence = args.get("confidence")
     return TurnResult(
         kind="escalate",
         text=(args.get("message_for_user") or "").strip() or None,
         staff_summary=summary,
         reason=(args.get("reason") or "").strip() or "escalated_by_agent",
+        refund_recommended=bool(args.get("refund_recommended")),
+        confidence=confidence if confidence in ("high", "medium", "low") else None,
+        draft_reply=draft,
     )
 
 
@@ -125,7 +132,8 @@ ESCALATE = ToolSpec(
     description=(
         "Передать обращение живому сотруднику: создаётся заявка, сотрудник видит карточку "
         "и может ответить юзеру напрямую. Вызывай, когда нужен человек — вопрос про деньги, "
-        "нерешённая техническая проблема, агрессия, прямая просьба позвать оператора."
+        "нерешённая техническая проблема, агрессия, прямая просьба позвать оператора. "
+        "Возврат ты не делаешь никогда: можешь только рекомендовать его сотруднику."
     ),
     parameters={
         "type": "object",
@@ -138,6 +146,26 @@ ESCALATE = ToolSpec(
             "message_for_user": {
                 "type": "string",
                 "description": "Что сказать юзеру, пока сотрудник не ответил. На его языке.",
+            },
+            "refund_recommended": {
+                "type": "boolean",
+                "description": (
+                    "Ставь true, если по результатам investigate_order похоже на нашу "
+                    "техническую ошибку и деньги стоит вернуть. Это рекомендация "
+                    "сотруднику, а не возврат: решает и нажимает кнопку он."
+                ),
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": "Насколько ты уверен в рекомендации возврата.",
+            },
+            "draft_reply": {
+                "type": "string",
+                "description": (
+                    "Готовый текст юзеру, который сотрудник отправит, если подтвердит "
+                    "возврат. На языке юзера, без обещаний «уже вернули»."
+                ),
             },
         },
         "required": ["reason", "summary_for_staff"],

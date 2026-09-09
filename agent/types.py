@@ -25,6 +25,11 @@ class TurnContext:
     # toner percentages and sheet counts out of the user's reply structurally,
     # instead of by asking the model not to mention them.
     staff_notes: list[str] = field(default_factory=list)
+    # What investigate_order found, kept so the staff card can be the full one
+    # with a refund button rather than a paragraph of prose. Whether that button
+    # appears is guard_rules' call, never the model's.
+    evidence: Any = None
+    review: Any = None
 
 
 @dataclass
@@ -42,6 +47,11 @@ class TurnResult:
     expect: str = "text"
     staff_summary: str | None = None
     reason: str | None = None
+    # A recommendation for the person who will decide. Whether the refund
+    # button is even offered is guard_rules' call - see review_refund_case.
+    refund_recommended: bool = False
+    confidence: str | None = None
+    draft_reply: str | None = None
     tool_calls: list[str] = field(default_factory=list)
     model_calls: int = 0
     error: str | None = None

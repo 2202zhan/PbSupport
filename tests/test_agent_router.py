@@ -5,6 +5,8 @@ answered, and a turn that needed a human actually reaches one.
 """
 import pytest
 
+from types import SimpleNamespace
+
 import storage
 from agent import router as agent_router
 from agent.types import TurnResult
@@ -222,3 +224,100 @@ async def test_what_the_agent_is_waiting_for_is_remembered(db):
         TurnResult(kind="reply", text="Пришлите чек", expect="file"),
     )
     assert (await storage.get_conversation(conversation)).expecting == "file"
+
+
+async def test_a_person_on_the_line_is_not_talked_over(db, monkeypatch):
+    # Once staff open the conversation, the user's words are theirs. An agent
+    # answering over the top of a person mid-sentence is worse than silence.
+    relayed = []
+
+    async def _find(_telegram_id):
+        return SimpleNamespace(id=7)
+
+    async def _relay(_bot, ticket, message):
+        relayed.append((ticket.id, message.text))
+
+    ran = []
+
+    async def _never(*_args, **_kwargs):
+        ran.append(True)
+
+    monkeypatch.setattr(agent_router.storage, "find_live_chat_ticket", _find)
+    monkeypatch.setattr(agent_router.notify, "relay_user_message", _relay)
+    monkeypatch.setattr(agent_router, "run_turn", _never)
+
+    message = _Message("а когда вернёте деньги?")
+    await agent_router._handle(None, None, message, message.text)
+
+    assert relayed == [(7, "а когда вернёте деньги?")]
+    assert ran == []
+
+
+async def test_start_does_not_hang_up_on_a_staff_member(db, monkeypatch):
+    async def _find(_telegram_id):
+        return SimpleNamespace(id=7)
+
+    monkeypatch.setattr(agent_router.storage, "find_live_chat_ticket", _find)
+    message = _Message()
+    await agent_router.on_start(message)
+    assert "сотрудник" in message.answered[0]
+
+
+async def test_a_recommended_refund_reaches_the_card_as_a_recommendation(db, monkeypatch):
+    # The agent may recommend; only guard_rules decides whether the button is
+    # even offered, and only a person taps it.
+    sent = {}
+
+    async def _send(bot, chat_id, ticket_id, evidence, decision, review=None):
+        sent.update(ticket_id=ticket_id, decision=decision, review=review)
+
+    monkeypatch.setattr(agent_router.notify, "send_escalation", _send)
+
+    from agent.types import TurnContext
+
+    ctx = TurnContext("884013433", "zhan", 1, "не вышло")
+    ctx.evidence = SimpleNamespace(transaction=None, apparat=None)
+    ctx.review = SimpleNamespace(can_refund=False)
+    ctx.staff_notes = ["Проверка заказа: транзакция не найдена"]
+
+    message = _Message()
+    await agent_router.deliver(
+        None, message, await _conversation_with("оплатил"),
+        TurnResult(kind="escalate", text="Передал сотруднику.", staff_summary="не вышло",
+                   refund_recommended=True, confidence="high", draft_reply="Возврат подтверждён."),
+        ctx=ctx,
+    )
+
+    assert sent["decision"].action == "recommend_refund"
+    assert sent["decision"].confidence == "high"
+    assert sent["decision"].draft_reply == "Возврат подтверждён."
+    assert "транзакция не найдена" in sent["decision"].staff_summary
+    assert sent["review"].can_refund is False  # the rules still say no
+
+
+async def test_a_found_payment_makes_the_ticket_about_money(db, monkeypatch):
+    async def _send(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_router.notify, "send_escalation", _send)
+
+    from agent.types import TurnContext
+
+    ctx = TurnContext("884013433", "zhan", 1, "не вышло")
+    ctx.evidence = SimpleNamespace(
+        transaction=SimpleNamespace(id="63192", machine="Аппарат №3"), apparat=None
+    )
+    ctx.review = SimpleNamespace(can_refund=True)
+
+    message = _Message()
+    conversation = await _conversation_with("оплатил, не вышло")
+    await agent_router.deliver(
+        None, message, conversation,
+        TurnResult(kind="escalate", text="Проверяю.", staff_summary="s"),
+        ctx=ctx,
+    )
+
+    ticket = await storage.get_ticket(1)
+    assert ticket.payment_expected == 1
+    assert ticket.transaction_id == "63192"
+    assert ticket.apparat_name == "Аппарат №3"

@@ -355,6 +355,10 @@ def _record(**overrides) -> storage.TicketRecord:
 
 def _escalating_followup(monkeypatch, ticket):
     monkeypatch.setattr(triage, "_STAGE_PAUSE_SECONDS", 0)
+    # These tests are about the follow-up, not the machine. Without pinning the
+    # clock they only passed outside working hours, when the apparat lookup
+    # short-circuits before touching the API.
+    monkeypatch.setattr(apparats.tz, "now", lambda: datetime(2026, 9, 9, 23, 0))
 
     async def _decide(**_):
         return triage.ai_decider.FollowupDecision(action="escalate", reason="r", staff_summary="s")

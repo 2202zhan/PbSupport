@@ -57,6 +57,12 @@ async def on_start(message: Message) -> None:
     """A fresh start means a fresh conversation - otherwise /start would carry
     yesterday's context into a new problem."""
     telegram_id = str(message.from_user.id)
+    if await storage.find_live_chat_ticket(telegram_id) is not None:
+        # A person is on the other end; /start must not silently drop them.
+        await message.answer(
+            "С вами сейчас переписывается сотрудник — пишите прямо здесь, он всё видит."
+        )
+        return
     conversation = await memory.current_conversation(telegram_id, message.from_user.username)
     await storage.close_conversation(conversation.id)
     await message.answer(_GREETING)
@@ -102,6 +108,18 @@ async def _handle(
 ) -> None:
     user = from_user or message.from_user
     telegram_id = str(user.id)
+
+    # While a staff member has the conversation open, everything the user
+    # writes goes to them. Answering over the top of a person mid-sentence is
+    # worse than not answering at all.
+    live = await storage.find_live_chat_ticket(telegram_id)
+    if live is not None:
+        try:
+            await notify.relay_user_message(bot, live, message)
+        except Exception:
+            logger.exception("could not relay to staff for ticket %s", live.id)
+            await message.answer("Не получилось передать сообщение, попробуйте ещё раз.")
+        return
     # People send "не печатает" and "аппарат 3" a second apart; without this
     # the two turns read the same history and answer each other's question.
     async with memory.one_turn_at_a_time(telegram_id):
@@ -116,7 +134,7 @@ async def _handle(
             on_progress=_progress(message),
         )
         result = await run_turn(ctx)
-        await deliver(bot, message, conversation.id, result, user=user, staff_notes=ctx.staff_notes)
+        await deliver(bot, message, conversation.id, result, user=user, ctx=ctx)
 
 
 def _progress(message: Message):
@@ -143,7 +161,7 @@ async def deliver(
     conversation_id: int,
     result: TurnResult,
     user=None,
-    staff_notes: list[str] | None = None,
+    ctx: TurnContext | None = None,
 ) -> None:
     """Carries out what the turn decided. Whatever else happens, the user is
     answered - a turn that reached a human still has to say so."""
@@ -162,27 +180,48 @@ async def deliver(
         return
 
     try:
-        ticket_id = await _open_ticket(message, conversation_id, user)
-        await _attach_receipt(bot, ticket_id, conversation_id)
-        await notify.send_plain_escalation(
-            bot,
-            settings.support_staff_chat_id,
-            ticket_id,
-            Decision(
-                action="escalate",
-                reason=result.reason or "escalated_by_agent",
-                # Everything the tools read on this turn, which the model was
-                # never shown - exact readings are useful to a person and only
-                # dangerous in a reply.
-                staff_summary="\n".join(
-                    [result.staff_summary or "", *(staff_notes or [])]
-                ).strip(),
-            ),
-        )
+        await _hand_to_staff(bot, message, conversation_id, result, user, ctx)
     except Exception:
         # The user has already been told a human is coming, so this must not
         # look like a normal reply - it is a hole, and it has to be loud.
         logger.exception("could not escalate agent conversation %s", conversation_id)
+
+
+async def _hand_to_staff(
+    bot: Bot,
+    message: Message,
+    conversation_id: int,
+    result: TurnResult,
+    user,
+    ctx: TurnContext | None,
+) -> None:
+    evidence = getattr(ctx, "evidence", None)
+    review = getattr(ctx, "review", None)
+    ticket_id = await _open_ticket(message, conversation_id, user, evidence)
+
+    decision = Decision(
+        action="recommend_refund" if result.refund_recommended else "escalate",
+        reason=result.reason or "escalated_by_agent",
+        # Everything the tools read this turn, which the model was never shown -
+        # exact readings are useful to a person and only dangerous in a reply.
+        staff_summary="\n".join(
+            [result.staff_summary or "", *(getattr(ctx, "staff_notes", None) or [])]
+        ).strip(),
+        confidence=result.confidence,
+        draft_reply=result.draft_reply,
+    )
+
+    if evidence is not None:
+        # The full card, with the refund button if - and only if - the rules
+        # allow one. The agent's recommendation is written on the card; whether
+        # money can move is guard_rules' call and a person's tap.
+        await notify.send_escalation(
+            bot, settings.support_staff_chat_id, ticket_id, evidence, decision, review
+        )
+        return
+
+    await notify.send_plain_escalation(bot, settings.support_staff_chat_id, ticket_id, decision)
+    await _attach_receipt(bot, ticket_id, conversation_id)
 
 
 async def _attach_receipt(bot: Bot, ticket_id: int, conversation_id: int) -> None:
@@ -200,17 +239,27 @@ async def _attach_receipt(bot: Bot, ticket_id: int, conversation_id: int) -> Non
         logger.warning("could not attach the receipt to ticket %s", ticket_id, exc_info=True)
 
 
-async def _open_ticket(message: Message, conversation_id: int, user) -> int:
+async def _open_ticket(message: Message, conversation_id: int, user, evidence=None) -> int:
     """A ticket is created here, at the moment a human is actually needed -
     not at the start of every conversation."""
     transcript = await memory.history(conversation_id)
     said = [m["content"] for m in transcript if m.get("role") == "user" and m.get("content")]
-    return await storage.create_ticket(
+    transaction = getattr(evidence, "transaction", None)
+    apparat = getattr(evidence, "apparat", None)
+    ticket_id = await storage.create_ticket(
         telegram_id=str(user.id),
         username=user.username,
         contact=None,
         problem_type="agent",
-        apparat_name=None,
+        apparat_name=(
+            transaction.machine if transaction else (apparat.name_apparat if apparat else None)
+        ),
         raw_text="\n".join(said[-5:]) or (message.text or ""),
-        payment_expected=False,
+        # Money was on the table only where a payment was actually found; the
+        # closing message and the "ask for a receipt" button both read wrong
+        # otherwise.
+        payment_expected=transaction is not None,
     )
+    if transaction is not None:
+        await storage.set_ticket_transaction(ticket_id, transaction.id)
+    return ticket_id

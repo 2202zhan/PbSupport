@@ -278,6 +278,8 @@ async def _investigate_order(args: dict, ctx: TurnContext) -> dict:
         manual_hint_time=hint_time,
         manual_hint_time_tolerance_seconds=120 if precise else 900,
         manual_hint_is_precise=precise,
+        receipt_photo_file_id=(receipt or {}).get("file_id"),
+        receipt_is_document=bool((receipt or {}).get("is_document")),
     )
     try:
         evidence = await diagnosis.gather_evidence(ctx.api, ticket)
@@ -286,6 +288,7 @@ async def _investigate_order(args: dict, ctx: TurnContext) -> dict:
         return {"ошибка": "проверка не прошла — данных нет, зови человека"}
 
     review = guard_rules.review_refund_case(evidence)
+    ctx.evidence, ctx.review = evidence, review
     ctx.staff_notes.append(_evidence_note(evidence, review))
 
     transaction = evidence.transaction
