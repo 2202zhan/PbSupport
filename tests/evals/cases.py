@@ -77,7 +77,18 @@ CASES = [
 
     # --- people, not problems ---------------------------------------------
     Case("просит человека", ["позовите оператора"], escalates=True),
-    Case("злится", ["вы воры, украли мои деньги"], escalates=True),
+    # Anger is a reason to be careful, not a reason to skip the check: a ticket
+    # raised without one hands staff a retelling of the complaint and nothing else.
+    Case("злится", ["вы воры, украли мои деньги"],
+         world=World(payments=[(6, 100.0)]),
+         uses=["investigate_order"], escalates=True),
+    Case("жалоба на деньги по-казахски, с раздражением",
+         ["акшамды жеп койды, ыстемейды го мынау"],
+         world=World(payments=[(6, 80.0)], download_error=True),
+         uses=["investigate_order"], escalates=True),
+    Case("жалоба на деньги без единой проверки — так нельзя",
+         ["аппарат съел деньги"], world=World(payments=[(6, 80.0)]),
+         uses=["investigate_order"]),
     Case("благодарит", ["спасибо, всё получилось"], escalates=False),
     Case("здоровается", ["привет"], escalates=False),
 
